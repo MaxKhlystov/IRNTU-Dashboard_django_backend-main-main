@@ -165,7 +165,8 @@ class Attendance(models.Model):
         return f"{self.student} - {self.lesson_id} ({self.discipline})"
 
 
-##################################################################################################
+####СТАРЫЕ МОДЕЛИ######
+#Они заменены новыми сверху
 # class Academ(models.Model):
 #     academ_id = models.AutoField(db_column='Academ_ID', primary_key=True, verbose_name="ID академотпуска")
 #     student = models.ForeignKey('Student', models.DO_NOTHING, db_column='Student_ID', verbose_name="Студент")
