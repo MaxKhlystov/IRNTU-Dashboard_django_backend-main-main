@@ -4,6 +4,8 @@ from rest_framework.response import Response
 from rest_framework import status
 from rest_framework import mixins, viewsets
 #from application.management.commands import analytics пока не трогаем аналитику
+#тестовая строка для проверки, потом убрать
+#test 09.04.26
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from django.core.management import call_command
 import json
