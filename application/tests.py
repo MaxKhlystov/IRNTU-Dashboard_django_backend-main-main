@@ -1,361 +1,297 @@
+"""
+Тесты для Django проекта IRNTU Dashboard
+
+Тестирует:
+- Утилиты для работы со студентами (student_utils)
+- Сервисы аналитики (GradeStatisticsService, StudentRatingService и др.)
+- API эндпоинты (ViewSet'ы)
+- Management команды
+"""
+
 import pytest
 from datetime import datetime
-from unittest.mock import patch, MagicMock, Mock
-from django.http import HttpRequest
-from rest_framework.request import Request
-from rest_framework.test import APIRequestFactory
+from django.test import TestCase
+from django.urls import reverse
+from rest_framework.test import APITestCase, APIClient
+from rest_framework import status
+from unittest.mock import patch, MagicMock
+from model_bakery import baker
 
-from application.api import GradesViewset, AcademicPerformanceViewSet, SubjectStatisticsViewSet, StudentRatingViewSet
+from application.utils.student_utils import (
+    extract_year_from_group_name,
+    calculate_course,
+    student_is_still_enrolled
+)
+from application.services.grade_statistics_service import GradeStatisticsService
+from application.services.student_rating_service import StudentRatingService
+from application.services.academic_performance_service import AcademicPerformanceService
+from application.services.subject_statistics_service import SubjectStatisticsService
+from application.models import (
+    Faculty, Speciality, StudentGroup, Student,
+    Discipline, ResultType, StudentResult, Attendance, Administrator
+)
 
 
-class TestGradesViewsetWithMocks:
-    """Тесты для GradesViewset"""
+# ============================================================
+# ЧАСТЬ 1: ТЕСТЫ УТИЛИТ (student_utils.py)
+# ============================================================
+
+class TestStudentUtils(TestCase):
+    """Тесты для вспомогательных функций работы со студентами"""
     
-    @pytest.fixture
-    def viewset(self):
-        return GradesViewset()
-    
-    @pytest.fixture
-    def mock_request(self):
-        factory = APIRequestFactory()
-        return factory.get('/api/grades/')
-    
-    def test_normalize_grade(self, viewset):
-        """Тестирование нормализации оценок"""
+    def test_extract_year_from_group_name_valid(self):
+        """Тест корректного извлечения года из названия группы"""
         test_cases = [
-            ("5", "5"),
-            ("4", "4"),
-            ("3", "3"),
-            ("2", "2"),
-            ("Зачтено", "зачет"),
-            ("Не зачтено", "незачет"),
-            ("Н/Я", "неявка"),
-            ("", "Не указано"),
-            ("Неизвестно", "Неизвестно")
-        ]
-        
-        for input_grade, expected_output in test_cases:
-            result = viewset.normalize_grade(input_grade)
-            assert result == expected_output, f"Failed for input: {input_grade}"
-    
-    def test_extract_year_from_group_name(self, viewset):
-        """Тестирование извлечения года из названия группы"""
-        test_cases = [
-            ("ФИТ-21Б", 2021),
-            ("МАТ-19А", 2019),
-            ("ФИЗ-23", 2023),
-            ("ИВТ-20В", 2020),
-            ("Некорректное-название", None),
-            ("Без-дефиса", None),
-            ("", None),
-            (None, None)
+            ("КСм-23", 2023),
+            ("ИТСб-21", 2021),
+            ("АСУб-22", 2022),
+            ("ЭБ-20", 2020),
+            ("ФИТ-19", 2019),
         ]
         
         for group_name, expected_year in test_cases:
-            result = viewset.extract_year_from_group_name(group_name)
-            assert result == expected_year, f"Failed for group: {group_name}"
+            with self.subTest(group_name=group_name):
+                result = extract_year_from_group_name(group_name)
+                self.assertEqual(result, expected_year)
     
-    @patch('application.api.datetime')
-    def test_calculate_course(self, mock_datetime, viewset):
-        """Тестирование расчета курса"""
-        # Январь 2024 - до сентября
-        mock_datetime.now.return_value = datetime(2024, 1, 15)
-        assert viewset.calculate_course(2021) == 3
+    def test_extract_year_from_group_name_invalid(self):
+        """Тест обработки некорректных названий групп"""
+        test_cases = [
+            ("", None),
+            (None, None),
+            ("Без-дефиса-но-много-частей", None),
+            ("ФИТ", None),
+            ("ФИТ-", None),
+            ("-23", None),
+            ("invalid", None),
+        ]
         
-        # Сентябрь 2024 - после сентября
-        mock_datetime.now.return_value = datetime(2024, 9, 15)
-        assert viewset.calculate_course(2021) == 4
-        
-        # Декабрь 2024 - после сентября
-        mock_datetime.now.return_value = datetime(2024, 12, 15)
-        assert viewset.calculate_course(2021) == 4
+        for group_name, expected in test_cases:
+            with self.subTest(group_name=group_name):
+                result = extract_year_from_group_name(group_name)
+                self.assertEqual(result, expected)
     
-    def test_student_is_still_enrolled(self, viewset):
-        """Тестирование проверки, учится ли студент"""
-        # Текущий год меньше года выпуска
-        with patch('application.api.datetime') as mock_datetime:
-            mock_datetime.now.return_value = datetime(2024, 6, 1)
-            assert viewset.student_is_still_enrolled(2021) == True
+    @patch('application.utils.student_utils.datetime')
+    def test_calculate_course_before_september(self, mock_datetime):
+        """Тест расчета курса до сентября (еще старый курс)"""
+        # 31 августа 2024
+        mock_datetime.now.return_value = datetime(2024, 8, 31)
         
-        # Текущий год равен году выпуска, но месяц до июля
-        with patch('application.api.datetime') as mock_datetime:
-            mock_datetime.now.return_value = datetime(2025, 6, 1)
-            assert viewset.student_is_still_enrolled(2021) == True
+        # Поступил в 2021 -> должен быть на 3 курсе (2024-2021=3)
+        self.assertEqual(calculate_course(2021), 3)
         
-        # Текущий год равен году выпуска, месяц после июля
-        with patch('application.api.datetime') as mock_datetime:
-            mock_datetime.now.return_value = datetime(2025, 8, 1)
-            assert viewset.student_is_still_enrolled(2021) == False
-        
-        # Текущий год больше года выпуска
-        with patch('application.api.datetime') as mock_datetime:
-            mock_datetime.now.return_value = datetime(2026, 1, 1)
-            assert viewset.student_is_still_enrolled(2021) == False
+        # Поступил в 2022 -> 2 курс
+        self.assertEqual(calculate_course(2022), 2)
     
-    def test_update_grade_stats(self, viewset):
-        """Тестирование обновления статистики оценок"""
-        grade_stats = {
+    @patch('application.utils.student_utils.datetime')
+    def test_calculate_course_after_september(self, mock_datetime):
+        """Тест расчета курса после сентября (уже новый курс)"""
+        # 1 сентября 2024
+        mock_datetime.now.return_value = datetime(2024, 9, 1)
+        
+        # Поступил в 2021 -> должен быть на 4 курсе (2024-2021+1=4)
+        self.assertEqual(calculate_course(2021), 4)
+        
+        # Поступил в 2022 -> 3 курс
+        self.assertEqual(calculate_course(2022), 3)
+    
+    @patch('application.utils.student_utils.datetime')
+    def test_calculate_course_december(self, mock_datetime):
+        """Тест расчета курса в декабре"""
+        mock_datetime.now.return_value = datetime(2024, 12, 25)
+        
+        self.assertEqual(calculate_course(2021), 4)
+        self.assertEqual(calculate_course(2022), 3)
+    
+    @patch('application.utils.student_utils.datetime')
+    def test_student_is_still_enrolled(self, mock_datetime):
+        """Тест проверки, учится ли студент еще"""
+        
+        # Случай 1: Еще не закончил (2024 год, выпуск 2025)
+        mock_datetime.now.return_value = datetime(2024, 6, 15)
+        self.assertTrue(student_is_still_enrolled(2021))
+        
+        # Случай 2: Год выпуска, но до июля
+        mock_datetime.now.return_value = datetime(2025, 6, 30)
+        self.assertTrue(student_is_still_enrolled(2021))
+        
+        # Случай 3: Год выпуска, после июля
+        mock_datetime.now.return_value = datetime(2025, 7, 1)
+        self.assertFalse(student_is_still_enrolled(2021))
+        
+        # Случай 4: Уже закончил
+        mock_datetime.now.return_value = datetime(2026, 1, 15)
+        self.assertFalse(student_is_still_enrolled(2021))
+
+
+# ============================================================
+# ЧАСТЬ 2: ТЕСТЫ СЕРВИСОВ
+# ============================================================
+
+class TestGradeStatisticsService(TestCase):
+    """Тесты для сервиса статистики оценок"""
+    
+    def test_normalize_grade_numeric(self):
+        """Тест нормализации числовых оценок"""
+        self.assertEqual(GradeStatisticsService.normalize_grade("5"), "5")
+        self.assertEqual(GradeStatisticsService.normalize_grade("4"), "4")
+        self.assertEqual(GradeStatisticsService.normalize_grade("3"), "3")
+        self.assertEqual(GradeStatisticsService.normalize_grade("2"), "2")
+    
+    def test_normalize_grade_text(self):
+        """Тест нормализации текстовых оценок"""
+        self.assertEqual(GradeStatisticsService.normalize_grade("Зачтено"), "зачет")
+        self.assertEqual(GradeStatisticsService.normalize_grade("Не зачтено"), "незачет")
+        self.assertEqual(GradeStatisticsService.normalize_grade("Н/Я"), "неявка")
+    
+    def test_normalize_grade_edge_cases(self):
+        """Тест граничных случаев"""
+        self.assertEqual(GradeStatisticsService.normalize_grade(""), "Не указано")
+        self.assertEqual(GradeStatisticsService.normalize_grade(None), "Не указано")
+        self.assertEqual(GradeStatisticsService.normalize_grade("Неизвестно"), "Неизвестно")
+    
+    def test_update_grade_stats(self):
+        """Тест обновления статистики оценок"""
+        stats = {
             'numeric_grades': [],
-            'countGrade2': 0, 'countGrade3': 0, 'countGrade4': 0, 'countGrade5': 0,
+            'countGrade2': 0, 'countGrade3': 0,
+            'countGrade4': 0, 'countGrade5': 0,
             'countZachet': 0, 'countNejavka': 0, 'countNezachet': 0
         }
         
         # Тестируем числовые оценки
-        viewset.update_grade_stats(grade_stats, "5")
-        assert grade_stats['countGrade5'] == 1
-        assert grade_stats['numeric_grades'] == [5]
+        GradeStatisticsService.update_grade_stats(stats, "5")
+        self.assertEqual(stats['countGrade5'], 1)
+        self.assertEqual(stats['numeric_grades'], [5])
         
-        viewset.update_grade_stats(grade_stats, "4")
-        assert grade_stats['countGrade4'] == 1
-        assert grade_stats['numeric_grades'] == [5, 4]
+        GradeStatisticsService.update_grade_stats(stats, "4")
+        self.assertEqual(stats['countGrade4'], 1)
+        self.assertEqual(stats['numeric_grades'], [5, 4])
         
-        # Тестируем зачеты/незачеты
-        viewset.update_grade_stats(grade_stats, "зачет")
-        assert grade_stats['countZachet'] == 1
+        # Тестируем зачет/незачет
+        GradeStatisticsService.update_grade_stats(stats, "зачет")
+        self.assertEqual(stats['countZachet'], 1)
         
-        viewset.update_grade_stats(grade_stats, "незачет")
-        assert grade_stats['countNezachet'] == 1
+        GradeStatisticsService.update_grade_stats(stats, "незачет")
+        self.assertEqual(stats['countNezachet'], 1)
         
-        # Тестируем неявку
-        viewset.update_grade_stats(grade_stats, "неявка")
-        assert grade_stats['countNejavka'] == 1
-    
-    @patch('application.api.StudentResult.objects')
-    def test_list_method_with_mocks(self, mock_studentresult, viewset, mock_request):
-        """Тестирование метода list"""
-        # Создаем моки для объектов
-        mock_student1 = MagicMock()
-        mock_student1.student_id = 1
-        mock_student1.group.name = "ФИТ-21Б"
-        mock_student1.is_academic = False
-        
-        mock_student2 = MagicMock()
-        mock_student2.student_id = 2
-        mock_student2.group.name = "ФИТ-21Б"
-        mock_student2.is_academic = False
-        
-        mock_discipline1 = MagicMock()
-        mock_discipline1.name = "Математика"
-        mock_discipline1.discipline_id = 1
-        
-        mock_discipline2 = MagicMock()
-        mock_discipline2.name = "Физика"
-        mock_discipline2.discipline_id = 2
-        
-        mock_result1 = MagicMock()
-        mock_result1.result_value = "5"
-        
-        mock_result2 = MagicMock()
-        mock_result2.result_value = "4"
-        
-        # Мокаем queryset
-        mock_queryset = MagicMock()
-        mock_queryset.select_related.return_value.filter.return_value = [
-            MagicMock(
-                student=mock_student1,
-                discipline=mock_discipline1,
-                result=mock_result1
-            ),
-            MagicMock(
-                student=mock_student1,
-                discipline=mock_discipline2,
-                result=mock_result2
-            ),
-            MagicMock(
-                student=mock_student2,
-                discipline=mock_discipline1,
-                result=mock_result1
-            )
-        ]
-        
-        mock_studentresult.select_related.return_value.filter.return_value = mock_queryset
-        
-        # Мокаем request
-        viewset.request = mock_request
-        viewset.request.query_params = {}
-        
-        # Вызываем метод list
-        response = viewset.list(mock_request)
-        
-        # Проверяем, что метод выполнился без ошибок
-        assert response.status_code == 200
-        assert 'summary' in response.data
-        assert 'students' in response.data
-        assert 'subjects' in response.data
-    
-    @patch('application.api.StudentResult.objects')
-    def test_list_with_filters(self, mock_studentresult, viewset, mock_request):
-        """Тестирование метода list с фильтрами"""
-        # Настраиваем моки
-        mock_student = MagicMock()
-        mock_student.student_id = 1
-        mock_student.group.name = "ФИТ-21Б"
-        mock_student.is_academic = False
-        
-        mock_discipline = MagicMock()
-        mock_discipline.name = "Математика"
-        mock_discipline.discipline_id = 1
-        
-        mock_result = MagicMock()
-        mock_result.result_value = "5"
-        
-        mock_queryset = MagicMock()
-        mock_queryset.select_related.return_value.filter.return_value = [
-            MagicMock(
-                student=mock_student,
-                discipline=mock_discipline,
-                result=mock_result
-            )
-        ]
-        
-        mock_studentresult.select_related.return_value.filter.return_value = mock_queryset
-        
-        # Тестируем с фильтром по группе
-        mock_request.query_params = {'group': 'ФИТ-21Б'}
-        viewset.request = mock_request
-        
-        response = viewset.list(mock_request)
-        assert response.status_code == 200
+        GradeStatisticsService.update_grade_stats(stats, "неявка")
+        self.assertEqual(stats['countNejavka'], 1)
 
 
-class TestAcademicPerformanceViewSetWithMocks:
-    """Тесты для AcademicPerformanceViewSet"""
+class TestStudentRatingService(TestCase):
+    """Тесты для сервиса рейтинга студентов"""
     
-    @pytest.fixture
-    def viewset(self):
-        return AcademicPerformanceViewSet()
+    def test_classify_debt_type(self):
+        """Тест классификации типов долгов"""
+        test_cases = [
+            ("2", "неуд"),
+            ("Н/Я", "неявка"),
+            ("Не зачтено", "незачет"),
+            ("", "другой"),
+            (None, "другой"),
+            ("Что-то странное", "другой"),
+        ]
+        
+        for grade_value, expected in test_cases:
+            with self.subTest(grade_value=grade_value):
+                result = StudentRatingService.classify_debt_type(grade_value)
+                self.assertEqual(result, expected)
     
-    @pytest.fixture
-    def mock_request(self):
-        factory = APIRequestFactory()
-        return factory.get('/api/academic-performance/')
+    def test_get_risk_level(self):
+        """Тест определения уровня риска"""
+        test_cases = [
+            (0.0, "низкий"),
+            (0.1, "низкий"),
+            (0.29, "низкий"),
+            (0.3, "средний"),
+            (0.5, "средний"),
+            (0.69, "средний"),
+            (0.7, "высокий"),
+            (0.9, "высокий"),
+            (1.0, "высокий"),
+        ]
+        
+        for risk_score, expected_level in test_cases:
+            with self.subTest(risk_score=risk_score):
+                result = StudentRatingService.get_risk_level(risk_score)
+                self.assertEqual(result, expected_level)
     
-    def test_get_debts_filter(self, viewset):
-        """Тестирование фильтра задолженностей"""
-        debts_filter = viewset.get_debts_filter()
+    def test_calculate_dropout_risk_formula(self):
+        """Тест формулы расчета риска отчисления"""
+        # Мокаем долги
+        with patch('application.services.student_rating_service.StudentResult.objects') as mock_result:
+            mock_result.filter.return_value.count.return_value = 0  # нет долгов
+            
+            # Студент с отличными показателями
+            risk = StudentRatingService.calculate_dropout_risk(
+                student_id=1,
+                avg_grade=4.8,
+                attendance_percent=95.0,
+                activity=4.5
+            )
+            self.assertLess(risk, 0.3)  # риск должен быть низким
+            
+            # Мокаем долги (2 долга)
+            mock_result.filter.return_value.count.return_value = 2
+            
+            risk = StudentRatingService.calculate_dropout_risk(
+                student_id=1,
+                avg_grade=2.5,
+                attendance_percent=30.0,
+                activity=1.5
+            )
+            self.assertGreater(risk, 0.5)  # риск должен быть высоким
+            self.assertLessEqual(risk, 1.0)  # но не больше 1
+
+
+class TestAcademicPerformanceService(TestCase):
+    """Тесты для сервиса академической успеваемости"""
+    
+    def test_get_debts_filter(self):
+        """Тест фильтра задолженностей"""
+        debts_filter = AcademicPerformanceService.get_debts_filter()
         
         # Проверяем, что фильтр содержит правильные условия
-        assert debts_filter is not None
-        
-        # Можно проверить строковое представление фильтра
         filter_str = str(debts_filter)
-        assert '2' in filter_str or 'Н/Я' in filter_str or 'Не зачтено' in filter_str
+        self.assertTrue(
+            '2' in filter_str or 
+            'Н/Я' in filter_str or 
+            'Не зачтено' in filter_str
+        )
     
-    @patch('application.api.Student.objects')
-    def test_get_queryset(self, mock_student, viewset):
-        """Тестирование базового queryset"""
-        # Мокаем аннотированный queryset
-        mock_queryset = MagicMock()
-        mock_student.select_related.return_value.filter.return_value.annotate.return_value.order_by.return_value = mock_queryset
+    def test_get_debt_distribution(self):
+        """Тест распределения задолженностей"""
+        # Создаем мок-студентов с разным количеством долгов
+        class MockStudent:
+            def __init__(self, debt_count):
+                self.debt_count = debt_count
         
-        queryset = viewset.get_queryset()
-        
-        # Проверяем, что методы были вызваны с правильными параметрами
-        mock_student.select_related.assert_called_once_with('group')
-        mock_student.select_related.return_value.filter.assert_called_once()
-    
-    @patch('application.api.Student.objects')
-    @patch('application.api.StudentGroup.objects')
-    def test_calculate_group_stats(self, mock_studentgroup, mock_student, viewset):
-        """Тестирование расчета статистики по группам"""
-        # Мокаем группы
-        mock_group1 = MagicMock()
-        mock_group1.name = "ФИТ-21Б"
-        
-        mock_group2 = MagicMock()
-        mock_group2.name = "ФИТ-22А"
-        
-        mock_studentgroup.filter.return_value = [mock_group1, mock_group2]
-        
-        # Мокаем студентов с задолженностями
-        mock_student1 = MagicMock()
-        mock_student1.debt_count = 2
-        
-        mock_student2 = MagicMock()
-        mock_student2.debt_count = 0
-        
-        mock_student3 = MagicMock()
-        mock_student3.debt_count = 1
-        
-        # Мокаем queryset для фильтрации по группам
-        mock_queryset = MagicMock()
-        mock_queryset.filter.return_value.exists.return_value = True
-        mock_queryset.filter.return_value.__iter__ = Mock(return_value=iter([mock_student1, mock_student2]))
-        mock_queryset.filter.return_value.__len__ = Mock(return_value=2)
-        
-        mock_student.select_related.return_value.filter.return_value.annotate.return_value.order_by.return_value = mock_queryset
-        
-        group_stats = viewset.calculate_group_stats(mock_queryset)
-        
-        # Проверяем структуру ответа
-        assert isinstance(group_stats, list)
-        assert len(group_stats) == 2
-        for stat in group_stats:
-            assert 'group' in stat
-            assert 'avgDebts' in stat
-            assert isinstance(stat['avgDebts'], float)
-    
-    def test_get_debt_distribution(self, viewset):
-        """Тестирование распределения задолженностей"""
-        # Создаем мок студентов с разным количеством задолженностей
-        mock_students = [
-            MagicMock(debt_count=0),  # 0 долгов
-            MagicMock(debt_count=0),  # 0 долгов
-            MagicMock(debt_count=1),  # 1 долг
-            MagicMock(debt_count=2),  # 2 долга
-            MagicMock(debt_count=2),  # 2 долга
-            MagicMock(debt_count=3),  # 3+ долга
-            MagicMock(debt_count=5),  # 3+ долга
+        students = [
+            MockStudent(0), MockStudent(0), MockStudent(0),  # 3 студента без долгов
+            MockStudent(1),  # 1 студент с 1 долгом
+            MockStudent(2), MockStudent(2),  # 2 студента с 2 долгами
+            MockStudent(3), MockStudent(4),  # 2 студента с 3+ долгами
         ]
         
-        distribution = viewset.get_debt_distribution(mock_students)
+        distribution = AcademicPerformanceService.get_debt_distribution(students)
         
-        assert distribution['zero_debts'] == 2
-        assert distribution['one_debt'] == 1
-        assert distribution['two_debts'] == 2
-        assert distribution['three_plus_debts'] == 2
+        self.assertEqual(distribution['zero_debts'], 3)
+        self.assertEqual(distribution['one_debt'], 1)
+        self.assertEqual(distribution['two_debts'], 2)
+        self.assertEqual(distribution['three_plus_debts'], 2)
     
-    @patch('application.api.StudentResult.objects')
-    def test_get_student_debts_details(self, mock_studentresult, viewset):
-        """Тестирование получения деталей задолженностей"""
-        # Мокаем студента
-        mock_student = MagicMock()
-        mock_student.student_id = 1
-        
-        # Мокаем долги
-        mock_debt1 = MagicMock()
-        mock_debt1.discipline.name = "Математика"
-        mock_debt1.result.result_value = "2"
-        
-        mock_debt2 = MagicMock()
-        mock_debt2.discipline.name = "Физика"
-        mock_debt2.result.result_value = "Н/Я"
-        
-        mock_studentresult.filter.return_value.select_related.return_value = [mock_debt1, mock_debt2]
-        
-        debts_details = viewset.get_student_debts_details(mock_student)
-        
-        assert len(debts_details) == 2
-        assert debts_details[0]['discipline'] == "Математика"
-        assert debts_details[0]['grade'] == "2"
-        assert debts_details[1]['discipline'] == "Физика"
-        assert debts_details[1]['grade'] == "Н/Я"
+    def test_calculate_group_stats_empty(self):
+        """Тест расчета статистики по группам с пустыми данными"""
+        stats = AcademicPerformanceService.calculate_group_stats([])
+        self.assertEqual(stats, [])
 
 
-class TestSubjectStatisticsViewSetWithMocks:
-    """Тесты для SubjectStatisticsViewSet"""
+class TestSubjectStatisticsService(TestCase):
+    """Тесты для сервиса статистики по предметам"""
     
-    @pytest.fixture
-    def viewset(self):
-        return SubjectStatisticsViewSet()
-    
-    @pytest.fixture
-    def mock_request(self):
-        factory = APIRequestFactory()
-        return factory.get('/api/subject-statistics/')
-    
-    def test_normalize_grade_value(self, viewset):
-        """Тестирование нормализации значений оценок"""
+    def test_normalize_grade_value(self):
+        """Тест нормализации значений оценок"""
         test_cases = [
             ("5", 5),
             ("4", 4),
@@ -365,367 +301,374 @@ class TestSubjectStatisticsViewSetWithMocks:
             ("Не зачтено", "незачет"),
             ("Н/Я", "неявка"),
             ("", None),
-            ("Неизвестно", None),
+            (None, None),
             ("6", None),
-            ("1", None)
+            ("1", None),
         ]
         
-        for input_value, expected_output in test_cases:
-            result = viewset.normalize_grade_value(input_value)
-            assert result == expected_output, f"Failed for input: {input_value}"
+        for input_val, expected in test_cases:
+            with self.subTest(input_val=input_val):
+                result = SubjectStatisticsService.normalize_grade_value(input_val)
+                self.assertEqual(result, expected)
     
-    @patch('application.api.StudentResult.objects')
-    @patch('application.api.Attendance.objects')
-    @patch('application.api.Student.objects')
-    def test_list_method_with_mocks(self, mock_student, mock_attendance, mock_studentresult, viewset, mock_request):
-        """Тестирование метода list с моками"""
-        # Мокаем студентов
-        mock_student1 = MagicMock()
-        mock_student1.student_id = 1
-        mock_student1.group.name = "ФИТ-21Б"
+    def test_calculate_activity_for_discipline(self):
+        """Тест расчета активности по предмету"""
+        # Идеальный предмет
+        activity = SubjectStatisticsService.calculate_activity_for_discipline(
+            avg_grade=5.0,
+            attendance_percent=100.0,
+            debt_ratio=0.0
+        )
+        self.assertAlmostEqual(activity, 5.0, places=1)
         
-        mock_student.objects.select_related.return_value.filter.return_value = [mock_student1]
+        # Плохой предмет
+        activity = SubjectStatisticsService.calculate_activity_for_discipline(
+            avg_grade=2.5,
+            attendance_percent=30.0,
+            debt_ratio=0.8
+        )
+        self.assertLess(activity, 3.0)
         
-        # Мокаем результаты
-        mock_discipline1 = MagicMock()
-        mock_discipline1.discipline_id = 1
-        mock_discipline1.name = "Математика"
+        # Граничный случай
+        activity = SubjectStatisticsService.calculate_activity_for_discipline(
+            avg_grade=0,
+            attendance_percent=0,
+            debt_ratio=1.0
+        )
+        self.assertGreaterEqual(activity, 0)
+        self.assertLessEqual(activity, 5.0)
+    
+    def test_empty_response(self):
+        """Тест пустого ответа"""
+        empty_response = SubjectStatisticsService._empty_response()
         
-        mock_discipline2 = MagicMock()
-        mock_discipline2.discipline_id = 2
-        mock_discipline2.name = "Физика"
+        self.assertIn('subjectStats', empty_response)
+        self.assertIn('gradeDistributionBar', empty_response)
+        self.assertIn('bestSubjects', empty_response)
+        self.assertEqual(empty_response['bestSubjects'], [])
+        self.assertEqual(empty_response['gradeDistributionBar']['2'], 0)
+
+
+# ============================================================
+# ЧАСТЬ 3: API ТЕСТЫ (интеграционные)
+# ============================================================
+
+class TestAuthenticationAPI(APITestCase):
+    """Тесты эндпоинтов аутентификации"""
+    
+    def setUp(self):
+        self.client = APIClient()
+        self.register_url = reverse('register')
+        self.login_url = reverse('login')
         
-        mock_result1 = MagicMock()
-        mock_result1.result.result_value = "5"
-        
-        mock_result2 = MagicMock()
-        mock_result2.result.result_value = "4"
-        
-        mock_queryset = MagicMock()
-        mock_queryset.select_related.return_value.filter.return_value = [
-            MagicMock(
-                student=mock_student1,
-                discipline=mock_discipline1,
-                result=mock_result1.result
-            ),
-            MagicMock(
-                student=mock_student1,
-                discipline=mock_discipline2,
-                result=mock_result2.result
-            )
-        ]
-        
-        mock_studentresult.select_related.return_value.filter.return_value = mock_queryset
-        
-        # Мокаем посещаемость
-        mock_attendance_stats = MagicMock()
-        mock_attendance_stats.aggregate.return_value = {
-            'unique_lessons': 10,
-            'unique_students': 5
+        # Создаем тестового админа
+        self.admin_data = {
+            'email': 'admin@test.com',
+            'name': 'Test Admin',
+            'password': 'testpass123'
         }
-        mock_attendance.filter.return_value = mock_attendance_stats
-        
-        # Настраиваем request
-        viewset.request = mock_request
-        viewset.request.query_params = {}
-        
-        # Вызываем метод list
-        response = viewset.list(mock_request)
-        
-        # Проверяем структуру ответа
-        assert response.status_code == 200
-        assert 'subjectStats' in response.data
-        assert 'gradeDistributionBar' in response.data
-        assert 'bestSubjects' in response.data
-
-
-class TestStudentRatingViewSetWithMocks:
-    """Тесты для StudentRatingViewSet"""
     
-    @pytest.fixture
-    def viewset(self):
-        return StudentRatingViewSet()
+    def test_register_success(self):
+        """Тест успешной регистрации"""
+        response = self.client.post(self.register_url, self.admin_data, format='json')
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(response.data['message'], 'Administrator created successfully!')
+        
+        # Проверяем, что пользователь создался
+        self.assertTrue(Administrator.objects.filter(email='admin@test.com').exists())
     
-    @pytest.fixture
-    def mock_request(self):
-        factory = APIRequestFactory()
-        return factory.get('/api/student-rating/')
-    
-    def test_normalize_grade_value(self, viewset):
-        """Тестирование нормализации значений оценок"""
-        test_cases = [
-            ("5", 5),
-            ("4", 4),
-            ("3", 3),
-            ("2", 2),
-            ("Зачтено", None),  # В этом ViewSet только числовые оценки
-            ("Не зачтено", None),
-            ("Н/Я", None),
-            ("", None),
-            ("6", None),
-            ("1", None)
-        ]
-        
-        for input_value, expected_output in test_cases:
-            result = viewset.normalize_grade_value(input_value)
-            assert result == expected_output, f"Failed for input: {input_value}"
-    
-    def test_classify_debt_type(self, viewset):
-        """Тестирование классификации типов долгов"""
-        test_cases = [
-            ("2", "неуд"),
-            ("Н/Я", "неявка"),
-            ("Не зачтено", "незачет"),
-            ("Другое", "другой"),
-            ("", "другой"),
-            (None, "другой")
-        ]
-        
-        for grade_value, expected_type in test_cases:
-            result = viewset.classify_debt_type(grade_value)
-            assert result == expected_type, f"Failed for grade: {grade_value}"
-    
-    @pytest.mark.parametrize("risk_score,expected_level", [
-        (0.0, "низкий"),
-        (0.1, "низкий"),
-        (0.29, "низкий"),
-        (0.3, "средний"),
-        (0.5, "средний"),
-        (0.69, "средний"),
-        (0.7, "высокий"),
-        (0.9, "высокий"),
-        (1.0, "высокий")
-    ])
-    def test_get_risk_level(self, risk_score, expected_level, viewset):
-        """Тестирование определения уровня риска"""
-        result = viewset.get_risk_level(risk_score)
-        assert result == expected_level
-    
-    @patch('application.api.StudentResult.objects')
-    def test_calculate_student_activity(self, mock_studentresult, viewset):
-        """Тестирование расчета активности студента"""
-        # Мокаем результаты студента
-        mock_passed_subjects = MagicMock()
-        mock_passed_subjects.count.return_value = 8
-        
-        mock_studentresult.filter.return_value = mock_passed_subjects
-        
-        # Мокаем посещаемость
-        with patch('application.api.Attendance.objects') as mock_attendance:
-            mock_attendance_count = MagicMock()
-            mock_attendance_count.count.return_value = 45
-            mock_attendance.filter.return_value = mock_attendance_count
-            
-            activity = viewset.calculate_student_activity(1)
-            
-            # Проверяем, что активность в пределах 0-5
-            assert 0 <= activity <= 5.0
-            assert isinstance(activity, float)
-    
-    @patch('application.api.Attendance.objects')
-    def test_calculate_attendance_percent(self, mock_attendance, viewset):
-        """Тестирование расчета процента посещаемости"""
-        # Мокаем количество посещений
-        mock_attendance_count = MagicMock()
-        mock_attendance_count.count.return_value = 45
-        mock_attendance.filter.return_value = mock_attendance_count
-        
-        attendance_percent = viewset.calculate_attendance_percent(1)
-        
-        # Проверяем, что процент в пределах 0-100
-        assert 0 <= attendance_percent <= 100.0
-        assert isinstance(attendance_percent, float)
-        
-        # Тест с нулевыми посещениями
-        mock_attendance_count.count.return_value = 0
-        attendance_percent = viewset.calculate_attendance_percent(1)
-        assert attendance_percent == 0.0
-    
-    @patch('application.api.StudentResult.objects')
-    def test_calculate_dropout_risk(self, mock_studentresult, viewset):
-        """Тестирование расчета риска отчисления"""
-        # Мокаем количество долгов
-        mock_debts = MagicMock()
-        mock_debts.count.return_value = 2
-        mock_studentresult.filter.return_value = mock_debts
-        
-        risk = viewset.calculate_dropout_risk(
-            student_id=1,
-            avg_grade=3.5,
-            attendance_percent=75.0,
-            activity=3.0
+    def test_register_duplicate_email(self):
+        """Тест регистрации с существующим email"""
+        # Создаем пользователя
+        Administrator.objects.create_user(
+            email='admin@test.com',
+            password='testpass123',
+            name='Test Admin'
         )
         
-        # Проверяем, что риск в пределах 0-1
-        assert 0 <= risk <= 1.0
-        assert isinstance(risk, float)
+        # Пытаемся создать дубликат
+        response = self.client.post(self.register_url, self.admin_data, format='json')
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
     
-    @patch('application.api.StudentResult.objects')
-    def test_get_student_debts_details(self, mock_studentresult, viewset):
-        """Тестирование получения деталей задолженностей"""
-        # Мокаем долги
-        mock_discipline1 = MagicMock()
-        mock_discipline1.name = "Математика"
+    def test_login_success(self):
+        """Тест успешного входа"""
+        # Сначала регистрируем пользователя
+        self.client.post(self.register_url, self.admin_data, format='json')
         
-        mock_discipline2 = MagicMock()
-        mock_discipline2.name = "Физика"
+        # Пытаемся войти
+        login_data = {
+            'email': 'admin@test.com',
+            'password': 'testpass123'
+        }
+        response = self.client.post(self.login_url, login_data, format='json')
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIn('access', response.data)
+        self.assertIn('refresh', response.data)
         
-        mock_result1 = MagicMock()
-        mock_result1.result_value = "2"
+        # Проверяем, что cookie установлена
+        self.assertIn('access_token', response.cookies)
+    
+    def test_login_wrong_password(self):
+        """Тест входа с неверным паролем"""
+        # Создаем пользователя
+        Administrator.objects.create_user(
+            email='admin@test.com',
+            password='testpass123',
+            name='Test Admin'
+        )
         
-        mock_result2 = MagicMock()
-        mock_result2.result_value = "Н/Я"
-        
-        mock_debt1 = MagicMock()
-        mock_debt1.discipline = mock_discipline1
-        mock_debt1.result = mock_result1
-        
-        mock_debt2 = MagicMock()
-        mock_debt2.discipline = mock_discipline2
-        mock_debt2.result = mock_result2
-        
-        mock_studentresult.filter.return_value.select_related.return_value = [mock_debt1, mock_debt2]
-        
-        debts_details = viewset.get_student_debts_details(1)
-        
-        assert len(debts_details) == 2
-        assert debts_details[0]['discipline'] == "Математика"
-        assert debts_details[0]['grade'] == "2"
-        assert debts_details[0]['type'] == "неуд"
-        assert debts_details[1]['discipline'] == "Физика"
-        assert debts_details[1]['grade'] == "Н/Я"
-        assert debts_details[1]['type'] == "неявка"
+        login_data = {
+            'email': 'admin@test.com',
+            'password': 'wrongpassword'
+        }
+        response = self.client.post(self.login_url, login_data, format='json')
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+        self.assertEqual(response.data['error'], 'Неверные данные')
 
 
-class TestEdgeCasesWithMocks:
-    """Тесты для граничных случаев с моками"""
+class TestStatisticsAPI(APITestCase):
+    """Тесты API статистики (требуют аутентификации)"""
     
-    def test_empty_inputs_grades_viewset(self):
-        """Тестирование обработки пустых входных данных в GradesViewset"""
-        viewset = GradesViewset()
+    def setUp(self):
+        self.client = APIClient()
         
-        # Пустые строки и None
-        assert viewset.normalize_grade("") == "Не указано"
-        assert viewset.normalize_grade(None) == "Не указано"
+        # Создаем и аутентифицируем админа
+        self.admin = Administrator.objects.create_user(
+            email='admin@test.com',
+            password='testpass123',
+            name='Test Admin',
+            is_staff=True
+        )
+        self.client.force_authenticate(user=self.admin)
         
-        # Некорректные названия групп
-        assert viewset.extract_year_from_group_name("") is None
-        assert viewset.extract_year_from_group_name("Некорректно") is None
-        assert viewset.extract_year_from_group_name("ФИТ") is None
-        assert viewset.extract_year_from_group_name("ФИТ-") is None
+        # Создаем тестовые данные
+        self._create_test_data()
     
-    def test_invalid_grade_values_all_viewsets(self):
-        """Тестирование обработки невалидных оценок во всех ViewSet"""
-        grades_viewset = GradesViewset()
-        subject_viewset = SubjectStatisticsViewSet()
-        rating_viewset = StudentRatingViewSet()
+    def _create_test_data(self):
+        """Создание тестовых данных в БД"""
+        # Факультет
+        self.faculty = Faculty.objects.create(
+            faculty_id=1,
+            name='Институт информационных технологий'
+        )
         
-        # Невалидные числовые значения
-        invalid_grades = ["6", "1", "0", "-1", "1.5", "abc", "!"]
+        # Специальность
+        self.speciality = Speciality.objects.create(
+            speciality_id=1,
+            name='Информационные системы',
+            faculty=self.faculty
+        )
         
-        for invalid_grade in invalid_grades:
-            # GradesViewset оставляет как есть
-            assert grades_viewset.normalize_grade(invalid_grade) == invalid_grade
-            
-            # SubjectStatisticsViewSet возвращает None
-            assert subject_viewset.normalize_grade_value(invalid_grade) is None
-            
-            # StudentRatingViewSet возвращает None
-            assert rating_viewset.normalize_grade_value(invalid_grade) is None
+        # Группа
+        self.group = StudentGroup.objects.create(
+            group_id=1,
+            name='ИСТб-21',
+            speciality=self.speciality
+        )
+        
+        # Студент
+        self.student = Student.objects.create(
+            student_id=12345,
+            birthday='2000-01-01',
+            is_academic=False,
+            group=self.group
+        )
+        
+        # Дисциплина
+        self.discipline = Discipline.objects.create(
+            discipline_id=1,
+            name='Программирование'
+        )
+        
+        # Тип результата
+        self.result_type = ResultType.objects.create(
+            result_id=5,
+            result_value='5'
+        )
+        
+        # Результат студента
+        self.student_result = StudentResult.objects.create(
+            student=self.student,
+            discipline=self.discipline,
+            result=self.result_type
+        )
     
-    @patch('application.api.datetime')
-    def test_boundary_dates_course_calculation(self, mock_datetime, viewset=None):
-        """Тестирование граничных дат для расчета курса"""
-        if viewset is None:
-            viewset = GradesViewset()
+    def test_grades_statistics_endpoint(self):
+        """Тест эндпоинта статистики оценок"""
+        url = reverse('api-grades-list')
+        response = self.client.get(url)
         
-        # 31 августа - еще старый курс
-        mock_datetime.now.return_value = datetime(2024, 8, 31)
-        assert viewset.calculate_course(2021) == 3
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIn('summary', response.data)
+        self.assertIn('students', response.data)
+        self.assertIn('subjects', response.data)
+    
+    def test_grades_statistics_with_filters(self):
+        """Тест эндпоинта статистики оценок с фильтрами"""
+        url = reverse('api-grades-list')
         
-        # 1 сентября - уже новый курс
-        mock_datetime.now.return_value = datetime(2024, 9, 1)
-        assert viewset.calculate_course(2021) == 4
+        # Фильтр по группе
+        response = self.client.get(url, {'group': 'ИСТб-21'})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
         
-        # 31 декабря - все еще новый курс
-        mock_datetime.now.return_value = datetime(2024, 12, 31)
-        assert viewset.calculate_course(2021) == 4
+        # Фильтр по предмету
+        response = self.client.get(url, {'subject': 'Программирование'})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+    
+    def test_subject_statistics_endpoint(self):
+        """Тест эндпоинта статистики по предметам"""
+        url = reverse('subject-list')
+        response = self.client.get(url)
+        
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIn('subjectStats', response.data)
+        self.assertIn('gradeDistributionBar', response.data)
+        self.assertIn('bestSubjects', response.data)
+    
+    def test_subject_statistics_with_sorting(self):
+        """Тест эндпоинта с сортировкой"""
+        url = reverse('subject-list')
+        
+        # Сортировка по среднему баллу
+        response = self.client.get(url, {'sortBy': 'avg', 'limit': 5})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        
+        # Сортировка по активности
+        response = self.client.get(url, {'sortBy': 'activity', 'limit': 10})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+    
+    def test_academic_performance_endpoint(self):
+        """Тест эндпоинта академической успеваемости"""
+        url = reverse('performance-list')
+        response = self.client.get(url)
+        
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIn('debtsDistribution', response.data)
+        self.assertIn('groupAverages', response.data)
+        self.assertIn('students', response.data)
+    
+    def test_student_rating_endpoint(self):
+        """Тест эндпоинта рейтинга студентов"""
+        url = reverse('api-rating-list')
+        response = self.client.get(url)
+        
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIn('chartData', response.data)
+        self.assertIn('students', response.data)
+    
+    def test_student_rating_with_limit(self):
+        """Тест эндпоинта рейтинга с ограничением"""
+        url = reverse('api-rating-list')
+        response = self.client.get(url, {'limit': 5, 'sortBy': 'rating'})
+        
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertLessEqual(len(response.data['students']), 5)
 
 
-# Интеграционные тесты с моками
-class TestIntegrationWithMocks:
-    """Интеграционные тесты с полным мокированием"""
+class TestUnauthorizedAccess(APITestCase):
+    """Тесты доступа без аутентификации"""
     
-    @patch('application.api.Student.objects')
-    @patch('application.api.StudentResult.objects')
-    @patch('application.api.Attendance.objects')
-    def test_complete_student_rating_flow(self, mock_attendance, mock_studentresult, mock_student):
-        """Тест полного потока расчета рейтинга студента"""
-        viewset = StudentRatingViewSet()
-        
-        # Мокаем студентов
-        mock_student1 = MagicMock()
-        mock_student1.student_id = 1
-        mock_student1.group.name = "ФИТ-21Б"
-        mock_student1.group.speciality.faculty.name = "ФИТ"
-        
-        mock_student.objects.select_related.return_value.filter.return_value = [mock_student1]
-        
-        # Мокаем результаты с оценками
-        mock_result_queryset = MagicMock()
-        mock_result_queryset.select_related.return_value = [
-            MagicMock(result=MagicMock(result_value="5")),
-            MagicMock(result=MagicMock(result_value="4")),
-            MagicMock(result=MagicMock(result_value="5"))
+    def setUp(self):
+        self.client = APIClient()
+    
+    def test_statistics_endpoints_require_auth(self):
+        """Тест, что эндпоинты статистики требуют аутентификации"""
+        endpoints = [
+            reverse('api-grades-list'),
+            reverse('subject-list'),
+            reverse('performance-list'),
+            reverse('api-rating-list'),
         ]
-        mock_studentresult.filter.return_value = mock_result_queryset
         
-        # Мокаем посещаемость
-        mock_attendance.filter.return_value.count.return_value = 50
-        
-        # Мокаем долги
-        mock_debts = MagicMock()
-        mock_debts.count.return_value = 1
-        mock_studentresult.filter.return_value = mock_debts
-        
-        # Тестируем расчет среднего балла
-        numeric_grades = []
-        for result in mock_result_queryset.select_related.return_value:
-            grade_value = viewset.normalize_grade_value(result.result.result_value)
-            if grade_value and 2 <= grade_value <= 5:
-                numeric_grades.append(grade_value)
-        
-        assert numeric_grades == [5, 4, 5]
-        assert sum(numeric_grades) / len(numeric_grades) == pytest.approx(4.67, 0.01)
-        
-        # Тестируем расчет активности
-        mock_passed_subjects = MagicMock()
-        mock_passed_subjects.count.return_value = 10
-        mock_studentresult.filter.return_value = mock_passed_subjects
-        
-        activity = viewset.calculate_student_activity(1)
-        assert 0 <= activity <= 5.0
-        
-        # Тестируем расчет посещаемости
-        attendance_percent = viewset.calculate_attendance_percent(1)
-        assert 0 <= attendance_percent <= 100.0
-        
-        # Тестируем расчет риска
-        risk = viewset.calculate_dropout_risk(1, 4.67, attendance_percent, activity)
-        assert 0 <= risk <= 1.0
+        for url in endpoints:
+            with self.subTest(url=url):
+                response = self.client.get(url)
+                self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
 
 
-if __name__ == "__main__":
-    print("Running mocked tests...")
+# ============================================================
+# ЧАСТЬ 4: ТЕСТЫ МОДЕЛЕЙ
+# ============================================================
+
+class TestModels(TestCase):
+    """Тесты моделей данных"""
     
-    # Test GradesViewset
-    test_grades = TestGradesViewsetWithMocks()
-    test_grades.test_normalize_grade()
-    test_grades.test_extract_year_from_group_name()
-    test_grades.test_update_grade_stats()
+    def setUp(self):
+        self.faculty = Faculty.objects.create(
+            faculty_id=1,
+            name='Тестовый факультет'
+        )
+        
+        self.speciality = Speciality.objects.create(
+            speciality_id=1,
+            name='Тестовая специальность',
+            faculty=self.faculty
+        )
+        
+        self.group = StudentGroup.objects.create(
+            group_id=1,
+            name='ТЕСТ-21',
+            speciality=self.speciality
+        )
+        
+        self.student = Student.objects.create(
+            student_id=123,
+            birthday='2000-01-01',
+            is_academic=False,
+            group=self.group
+        )
+        
+        self.discipline = Discipline.objects.create(
+            discipline_id=1,
+            name='Тестовая дисциплина'
+        )
+        
+        self.result_type = ResultType.objects.create(
+            result_id=5,
+            result_value='5'
+        )
     
-    # Test StudentRatingViewSet
-    test_rating = TestStudentRatingViewSetWithMocks()
-    test_rating.test_normalize_grade_value()
-    test_rating.test_classify_debt_type()
-    test_rating.test_get_risk_level(0.1, "низкий")
+    def test_faculty_str(self):
+        """Тест строкового представления факультета"""
+        self.assertEqual(str(self.faculty), 'Тестовый факультет')
+    
+    def test_speciality_str(self):
+        """Тест строкового представления специальности"""
+        self.assertEqual(str(self.speciality), 'Тестовая специальность')
+    
+    def test_student_group_str(self):
+        """Тест строкового представления группы"""
+        self.assertEqual(str(self.group), 'ТЕСТ-21')
+    
+    def test_student_str(self):
+        """Тест строкового представления студента"""
+        self.assertEqual(str(self.student), 'Студент 123')
+    
+    def test_discipline_str(self):
+        """Тест строкового представления дисциплины"""
+        self.assertEqual(str(self.discipline), 'Тестовая дисциплина')
+    
+    def test_result_type_str(self):
+        """Тест строкового представления типа результата"""
+        self.assertEqual(str(self.result_type), '5')
+    
+    def test_student_result_creation(self):
+        """Тест создания результата студента"""
+        student_result = StudentResult.objects.create(
+            student=self.student,
+            discipline=self.discipline,
+            result=self.result_type
+        )
+        
+        self.assertIsNotNone(student_result)
+        self.assertEqual(student_result.student, self.student)
+        self.assertEqual(student_result.discipline, self.discipline)
+        self.assertEqual(student_result.result, self.result_type)
+
+
+# ============================================================
+# ЗАПУСК ТЕСТОВ
+# ============================================================
+
+if __name__ == '__main__':
+    pytest.main([__file__, '-v', '--tb=short'])
