@@ -136,15 +136,28 @@ WSGI_APPLICATION = 'app.wsgi.application'
 #        },
 #    }
 # }
+#
+#Старый код подключения к БД (локально)
+#DATABASES = {
+#    'default': {
+#        'ENGINE': 'django.db.backends.postgresql_psycopg2',
+#        'NAME': 'project_db',
+#        'USER': 'postgres',
+#        'PASSWORD': '12345',
+#        'HOST': 'localhost',#'172.17.0.1', #'localhost', # заменила
+#        'PORT': '5432',
+#    },
+#}
 
+#Новый код подключения к БД (если есть хост в Докере, то подключиться к нему, если нет, то будет подключаться локально
 DATABASES = {
     'default': {
         'ENGINE': 'django.db.backends.postgresql_psycopg2',
-        'NAME': 'project_db',
-        'USER': 'postgres',
-        'PASSWORD': '12345',
-        'HOST': 'localhost',#'172.17.0.1', #'localhost', # заменила
-        'PORT': '5432',
+        'NAME': os.environ.get('DB_NAME', 'project_db'),
+        'USER': os.environ.get('DB_USER', 'postgres'),
+        'PASSWORD': os.environ.get('DB_PASSWORD', '12345'),
+        'HOST': os.environ.get('DB_HOST', 'localhost'),
+        'PORT': os.environ.get('DB_PORT', '5432'),
     },
 }
 
