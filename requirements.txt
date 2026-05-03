@@ -13,8 +13,9 @@ typing_extensions==4.12.2
 tzdata==2024.2
 
 pandas==2.2.3
-numpy==1.26.4 #2.2.3
-scikit-learn==1.4.2 #1.6.1
+numpy==2.2.3 #1.26.4
+#scikit-learn==1.4.2 #1.6.1
+scikit-learn>=1.6.0
 openpyxl == 3.1.5
 seaborn == 0.13.2
 matplotlib == 3.9.2
@@ -24,7 +25,7 @@ matplotlib == 3.9.2
 #pyodbc==5.2.0
 #mssql-django==1.5
 
-psycopg2-binary==2.9.9 # добавила
+psycopg2-binary==2.9.10 # добавила
 
 pytest==8.4.2
 pytest-django==4.11.1
