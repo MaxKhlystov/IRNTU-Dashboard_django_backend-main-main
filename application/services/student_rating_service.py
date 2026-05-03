@@ -1,7 +1,11 @@
 from datetime import datetime
+from time import time
+from django.core.cache import cache
 from typing import Optional, List, Dict, Any
-from django.db.models import Count
 from application.models import Student, StudentResult, Attendance
+from django.db.models import Avg, Count, Q, Value, FloatField, Case, When
+from django.db.models.functions import Cast
+import traceback
 
 
 class StudentRatingService:
@@ -362,15 +366,9 @@ class StudentRatingService:
                         student_ids.append(student.student_id)
         return student_ids
 
+    #Новая версия
     @classmethod
-    def get_rating_data(
-        cls,
-        course: Optional[int] = None,
-        group: Optional[str] = None,
-        subject: Optional[str] = None,
-        sort_by: str = 'rating',
-        limit: int = 10
-    ) -> Dict[str, Any]:
+    def get_rating_data(cls, course=None, group=None, subject=None, sort_by='rating', limit=10):
         """
         Основной метод сервиса. Формирует рейтинговый список студентов с полной аналитикой.
         
@@ -396,119 +394,268 @@ class StudentRatingService:
                     "students": [ ... ]   # Детальные данные для таблицы
                 }
         """
-        qs = Student.objects.select_related('group').filter(is_academic=False)
-
-        # Фильтр по группе
-        if group:
-            qs = qs.filter(group__name=group)
-
-        # Фильтр по курсу
-        if course is not None:
-            valid_ids = cls.get_students_in_course(course)
-            qs = qs.filter(student_id__in=valid_ids)
-
-        # Фильтр по предмету
-        if subject:
-            student_ids = StudentResult.objects.filter(
-                discipline__name__icontains=subject
-            ).values_list('student_id', flat=True).distinct()
-            qs = qs.filter(student_id__in=student_ids)
-
-        # Сбор данных
-        students_data = []
-        for student in qs:
-            # Средний балл
-            numeric_grades = []
-            results = StudentResult.objects.filter(student=student).select_related('result')
-            has_debts = False
-            for result in results:
-                val = result.result.result_value
-                if val in ['2', 'Н/Я', 'Не зачтено']:
-                    has_debts = True
-                grade_val = cls.normalize_grade_value(val)
-                if grade_val is not None:
-                    numeric_grades.append(grade_val)
+        cache_key = f"rating:{course}:{group}:{subject}:{sort_by}:{limit}"
+        cached = cache.get(cache_key)
+        if cached:
+            return cached
+        
+        start = time.time()
+        
+        try:
+            qs = Student.objects.filter(is_academic=False)
+            if group:
+                qs = qs.filter(group__name=group)
             
-            avg_grade = sum(numeric_grades) / len(numeric_grades) if numeric_grades else 0.0
-
-            # Активность и посещаемость 
-            activity = cls.calculate_student_activity(student.student_id)
-            attendance_percent = cls.calculate_attendance_percent(student.student_id)
-
-            # Рейтинг (композитный показатель)
-            # Используем новую активность как базу, плюс небольшой буст за абсолютные значения
-            rating = (activity * 0.6) + (avg_grade * 0.4)
-            # Нормализация к шкале 0-100 для удобства отображения
-            rating = min(rating * 20, 100.0) 
-
-            # Курс
-            course_num = None
-            if student.group and student.group.name:
-                year = cls.extract_year_from_group_name(student.group.name)
-                if year is not None:
-                    course_num = cls.calculate_course(year)
-
-            students_data.append({
-                'student': student,
-                'avg_grade': avg_grade,
-                'activity': activity,
-                'attendance_percent': attendance_percent,
-                'rating': rating,
-                'course': course_num,
-                'has_debts': has_debts
-            })
-
-        # Сортировка
-        sort_field_map = {
-            'rating': 'rating',
-            'performance': 'avg_grade',
-            'attendance': 'attendance_percent',
-            'activity': 'activity'
-        }
-        sort_key = sort_field_map.get(sort_by, 'rating')
-        students_data.sort(key=lambda x: x[sort_key], reverse=True)
-        students_data = students_data[:limit]
-
-        chart_data = []
-        students_response = []
-
-        for data in students_data:
-            student = data['student']
+            student_ids = list(qs.values_list('student_id', flat=True))
+            if not student_ids:
+                return {'chartData': [], 'students': []}
             
-            # Пересчет риска с новыми входными данными
-            dropout_risk = cls.calculate_dropout_risk(
-                student.student_id,
-                data['avg_grade'],
-                data['attendance_percent'],
-                data['activity']
+            grades_agg = StudentResult.objects.filter(
+                student_id__in=student_ids
+            ).values('student_id').annotate(
+                avg_grade=Avg(
+                    Case(
+                        When(result__result_value__in=['2','3','4','5'], 
+                            then=Cast('result__result_value', FloatField())),
+                        default=None,
+                        output_field=FloatField()
+                    )
+                ),
+                debt_count=Count('student_id', filter=Q(result__result_value__in=['2', 'Н/Я', 'Не зачтено']))
             )
             
-            debts_details = cls.get_student_debts_details(student.student_id)
-            debt_count = len(debts_details)
+            attendance_agg = Attendance.objects.filter(
+                student_id__in=student_ids
+            ).values('student_id').annotate(
+                total_visits=Count('lesson_id')
+            )
+            
+            max_att_by_group = dict(
+                Attendance.objects.filter(
+                    student__group__isnull=False,
+                    student_id__in=student_ids
+                ).values('student__group__name').annotate(
+                    max_visits=Count('lesson_id')
+                ).values_list('student__group__name', 'max_visits')
+            )
+            
+            grades_dict = {g['student_id']: {'avg': float(g['avg_grade'] or 0), 'debts': g['debt_count']} 
+                        for g in grades_agg}
+            attendance_dict = {a['student_id']: a['total_visits'] for a in attendance_agg}
+            
+            results = []
+            for student in qs.select_related('group'):
+                sid = student.student_id
+                group_name = student.group.name if student.group else 'Неизвестно'
+                
+                avg_grade = grades_dict.get(sid, {}).get('avg', 0)
+                debt_count = grades_dict.get(sid, {}).get('debts', 0)
+                total_visits = attendance_dict.get(sid, 0)
+                max_visits = max_att_by_group.get(group_name, 1)
+                
+                attendance_percent = min((total_visits / max_visits) * 100, 100) if max_visits > 0 else 0
+                
+                has_debts = debt_count > 0
+                grade_score = avg_grade
+                attendance_score = attendance_percent / 100 * 5
+                debt_bonus = 1.0 if not has_debts and avg_grade > 0 else 0
+                activity = (grade_score * 0.5) + (attendance_score * 0.3) + (debt_bonus * 1.0)
+                rating = min(activity * 20, 100)
+                
+                course_num = None
+                if group_name and '-' in group_name:
+                    try:
+                        year_suffix = int(group_name.split('-')[1][:2])
+                        course_num = cls.calculate_course(2000 + year_suffix)
+                    except:
+                        pass
+                
+                results.append({
+                    'student_id': sid,
+                    'group': group_name,
+                    'course': course_num,
+                    'avg_grade': round(avg_grade, 2),
+                    'activity': round(activity, 2),
+                    'attendance_percent': round(attendance_percent, 2),
+                    'rating': round(rating, 2),
+                    'debt_count': debt_count,
+                    'has_debts': has_debts
+                })
+            
+            sort_map = {'rating': 'rating', 'performance': 'avg_grade', 
+                        'attendance': 'attendance_percent', 'activity': 'activity'}
+            results.sort(key=lambda x: x[sort_map.get(sort_by, 'rating')], reverse=True)
+            results = results[:limit]
+            
+            students_response = [{
+                'id': r['student_id'],
+                'name': f"Студент {r['student_id']}",
+                'group': r['group'],
+                'course': r['course'],
+                'avgGrade': r['avg_grade'],
+                'activity': r['activity'],
+                'attendancePercent': r['attendance_percent'],
+                'debtCount': r['debt_count'],
+                'debtsDetails': [],
+                'rating': r['rating']
+            } for r in results]
+            
+            result = {'chartData': students_response, 'students': students_response}
+            
+            cache.set(cache_key, result, 300)
+            
+            return result
+            
+        except Exception as e:
+            traceback.print_exc()
+            return {'chartData': [], 'students': []}
+    # #@classmethod
+    # def get_rating_data(
+    #     cls,
+    #     course: Optional[int] = None,
+    #     group: Optional[str] = None,
+    #     subject: Optional[str] = None,
+    #     sort_by: str = 'rating',
+    #     limit: int = 10
+    # ) -> Dict[str, Any]:
+    #     """
+    #     Основной метод сервиса. Формирует рейтинговый список студентов с полной аналитикой.
+        
+    #     Выполняет следующие шаги:
+    #     1. Фильтрация студентов по курсу, группе или предмету.
+    #     2. Расчет метрик для каждого студента (средний балл, активность, посещаемость).
+    #     3. Вычисление композитного рейтинга.
+    #     4. Сортировка и ограничение выборки (limit).
+    #     5. Расчет риска отчисления и детализация долгов для топ-N студентов.
+    #     6. Формирование ответа для графиков и таблиц.
+        
+    #     Args:
+    #         course (int, optional): Фильтр по номеру курса.
+    #         group (str, optional): Фильтр по названию группы.
+    #         subject (str, optional): Фильтр по предмету (включает студентов, у которых есть оценка по этому предмету).
+    #         sort_by (str): Критерий сортировки ('rating', 'performance', 'attendance', 'activity').
+    #         limit (int): Максимальное количество возвращаемых записей.
+            
+    #     Returns:
+    #         Dict[str, Any]: Структурированные данные:
+    #             {
+    #                 "chartData": [ ... ], # Данные для графиков
+    #                 "students": [ ... ]   # Детальные данные для таблицы
+    #             }
+    #     """
+    #     qs = Student.objects.select_related('group').filter(is_academic=False)
 
-            chart_data.append({
-                'name': f"Студент {student.student_id}",
-                'avgGrade': round(data['avg_grade'], 2),
-                'activity': round(data['activity'], 2),
-                'attendancePercent': round(data['attendance_percent'], 2)
-            })
+    #     # Фильтр по группе
+    #     if group:
+    #         qs = qs.filter(group__name=group)
 
-            students_response.append({
-                'id': student.student_id,
-                'name': f"Студент {student.student_id}", 
-                'group': student.group.name if student.group else None,
-                'course': data['course'],
-                'avgGrade': round(data['avg_grade'], 2),
-                'activity': round(data['activity'], 2),
-                'attendancePercent': round(data['attendance_percent'], 2),
-                'debtCount': debt_count,
-                'debtsDetails': debts_details,
-                'dropoutRisk': round(dropout_risk, 2),
-                'rating': round(data['rating'], 2),
-                'riskLevel': cls.get_risk_level(dropout_risk)
-            })
+    #     # Фильтр по курсу
+    #     if course is not None:
+    #         valid_ids = cls.get_students_in_course(course)
+    #         qs = qs.filter(student_id__in=valid_ids)
 
-        return {
-            'chartData': chart_data,
-            'students': students_response
-        }
+    #     # Фильтр по предмету
+    #     if subject:
+    #         student_ids = StudentResult.objects.filter(
+    #             discipline__name__icontains=subject
+    #         ).values_list('student_id', flat=True).distinct()
+    #         qs = qs.filter(student_id__in=student_ids)
+
+    #     # Сбор данных
+    #     students_data = []
+    #     for student in qs:
+    #         # Средний балл
+    #         numeric_grades = []
+    #         results = StudentResult.objects.filter(student=student).select_related('result')
+    #         has_debts = False
+    #         for result in results:
+    #             val = result.result.result_value
+    #             if val in ['2', 'Н/Я', 'Не зачтено']:
+    #                 has_debts = True
+    #             grade_val = cls.normalize_grade_value(val)
+    #             if grade_val is not None:
+    #                 numeric_grades.append(grade_val)
+            
+    #         avg_grade = sum(numeric_grades) / len(numeric_grades) if numeric_grades else 0.0
+
+    #         # Активность и посещаемость 
+    #         activity = cls.calculate_student_activity(student.student_id)
+    #         attendance_percent = cls.calculate_attendance_percent(student.student_id)
+
+    #         # Рейтинг (композитный показатель)
+    #         # Используем новую активность как базу, плюс небольшой буст за абсолютные значения
+    #         rating = (activity * 0.6) + (avg_grade * 0.4)
+    #         # Нормализация к шкале 0-100 для удобства отображения
+    #         rating = min(rating * 20, 100.0) 
+
+    #         # Курс
+    #         course_num = None
+    #         if student.group and student.group.name:
+    #             year = cls.extract_year_from_group_name(student.group.name)
+    #             if year is not None:
+    #                 course_num = cls.calculate_course(year)
+
+    #         students_data.append({
+    #             'student': student,
+    #             'avg_grade': avg_grade,
+    #             'activity': activity,
+    #             'attendance_percent': attendance_percent,
+    #             'rating': rating,
+    #             'course': course_num,
+    #             'has_debts': has_debts
+    #         })
+
+    #     # Сортировка
+    #     sort_field_map = {
+    #         'rating': 'rating',
+    #         'performance': 'avg_grade',
+    #         'attendance': 'attendance_percent',
+    #         'activity': 'activity'
+    #     }
+    #     sort_key = sort_field_map.get(sort_by, 'rating')
+    #     students_data.sort(key=lambda x: x[sort_key], reverse=True)
+    #     students_data = students_data[:limit]
+
+    #     chart_data = []
+    #     students_response = []
+
+    #     for data in students_data:
+    #         student = data['student']
+            
+    #         # Пересчет риска с новыми входными данными
+    #         dropout_risk = cls.calculate_dropout_risk(
+    #             student.student_id,
+    #             data['avg_grade'],
+    #             data['attendance_percent'],
+    #             data['activity']
+    #         )
+            
+    #         debts_details = cls.get_student_debts_details(student.student_id)
+    #         debt_count = len(debts_details)
+
+    #         chart_data.append({
+    #             'name': f"Студент {student.student_id}",
+    #             'avgGrade': round(data['avg_grade'], 2),
+    #             'activity': round(data['activity'], 2),
+    #             'attendancePercent': round(data['attendance_percent'], 2)
+    #         })
+
+    #         students_response.append({
+    #             'id': student.student_id,
+    #             'name': f"Студент {student.student_id}", 
+    #             'group': student.group.name if student.group else None,
+    #             'course': data['course'],
+    #             'avgGrade': round(data['avg_grade'], 2),
+    #             'activity': round(data['activity'], 2),
+    #             'attendancePercent': round(data['attendance_percent'], 2),
+    #             'debtCount': debt_count,
+    #             'debtsDetails': debts_details,
+    #             'dropoutRisk': round(dropout_risk, 2),
+    #             'rating': round(data['rating'], 2),
+    #             'riskLevel': cls.get_risk_level(dropout_risk)
+    #         })
+
+    #     return {
+    #         'chartData': chart_data,
+    #         'students': students_response
+    #     }

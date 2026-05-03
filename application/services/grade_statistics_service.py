@@ -2,6 +2,8 @@ from collections import defaultdict
 from typing import Optional, Set, Tuple
 from django.db.models import Q
 from application.models import Student, StudentResult
+from django.core.cache import cache
+import time
 from application.utils.student_utils import (
     extract_year_from_group_name,
     calculate_course,
@@ -87,12 +89,7 @@ class GradeStatisticsService:
         return student_ids
 
     @classmethod
-    def get_statistics(
-        cls,
-        course: Optional[int] = None,
-        group: Optional[str] = None,
-        subject: Optional[str] = None
-    ) -> dict:
+    def get_statistics(cls, course=None, group=None, subject=None) -> dict:
         """
         Основной метод сервиса. Собирает полную статистику успеваемости с фильтрацией.
         
@@ -141,15 +138,19 @@ class GradeStatisticsService:
                     ]
                 }
         """
-        # Фильтрация студентов по курсу
+        cache_key = f"grades:{course}:{group}:{subject}"
+        cached_data = cache.get(cache_key)
+        if cached_data:
+            return cached_data
+        start_time = time.time()
+        
         student_filter = Q(student__is_academic=False)
         if group:
             student_filter &= Q(student__group__name=group)
         if course is not None:
             valid_student_ids = cls.get_student_ids_by_course(course)
             if not valid_student_ids:
-                # Нет студентов на этом курсе
-                return {
+                empty_result = {
                     "summary": {
                         "totalStudents": 0,
                         "averageGrade": None,
@@ -166,6 +167,8 @@ class GradeStatisticsService:
                     "students": [],
                     "subjects": []
                 }
+                cache.set(cache_key, empty_result, 300)
+                return empty_result
             student_filter &= Q(student_id__in=valid_student_ids)
 
         results_qs = StudentResult.objects.select_related(
@@ -177,14 +180,13 @@ class GradeStatisticsService:
         if subject:
             results_qs = results_qs.filter(discipline__name=subject)
 
-        # Сбор данных
         students_data_dict = defaultdict(lambda: {
             "id": None,
             "group": None,
             "course": None,
             "subjects": defaultdict(list)
         })
-        subjects_info: Set[Tuple[str, int]] = set()
+        subjects_info = set()
         grade_stats = {
             'numeric_grades': [],
             'countGrade2': 0,
@@ -204,14 +206,12 @@ class GradeStatisticsService:
             if not result_value or not discipline:
                 continue
 
-            # Определяем курс студента
             course_num = None
             if student.group and student.group.name:
                 year = extract_year_from_group_name(student.group.name)
                 if year is not None:
                     course_num = calculate_course(year)
 
-            # Заполняем данные
             sid = student.student_id
             students_data_dict[sid]["id"] = sid
             students_data_dict[sid]["group"] = student.group.name if student.group else None
@@ -222,8 +222,7 @@ class GradeStatisticsService:
             normalized = cls.normalize_grade(result_value)
             students_data_dict[sid]["subjects"][disc_name].append(normalized)
             cls.update_grade_stats(grade_stats, normalized)
-
-        # Формируем ответ
+            
         students_data = []
         for data in students_data_dict.values():
             if data["id"] is None:
@@ -257,11 +256,14 @@ class GradeStatisticsService:
 
         subjects_list = [{"id": sid, "name": name} for name, sid in subjects_info]
 
-        return {
+        result = {
             "summary": summary,
             "students": students_data,
             "subjects": subjects_list
         }
+        
+        cache.set(cache_key, result, 300)     
+        return result
 
     @staticmethod
     def update_grade_stats(stats: dict, normalized_grade: str):

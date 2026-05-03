@@ -1,4 +1,6 @@
 from collections import defaultdict
+from django.core.cache import cache
+import time
 from django.db.models import Q, Count
 from application.models import Student, StudentResult, StudentGroup
 
@@ -225,14 +227,53 @@ class AcademicPerformanceService:
                         }, ...
                     ]
                 }
+        """"""
+        Основной метод сервиса. Собирает и возвращает полный набор данных 
+        об академической успеваемости для отображения в интерфейсе.
+        
+        Выполняет следующие шаги:
+        1. Формирует базовый запрос студентов с подсчетом долгов.
+        2. Применяет фильтры (по группе или поиску).
+        3. Извлекает данные в память (один SQL запрос).
+        4. Генерирует список студентов с деталями долгов.
+        5. Рассчитывает общее распределение должников.
+        6. Рассчитывает средние показатели по группам.
+        
+        Args:
+            group (str, optional): Фильтр по названию группы.
+            search (str, optional): Поисковый запрос (ID студента или часть названия группы).
+        
+        Returns:
+            dict: Структурированные данные для API:
+                {
+                    "debtsDistribution": {
+                        "0": int, "1": int, "2": int, "3plus": int
+                    },
+                    "groupAverages": [
+                        {"group": str, "avgDebts": float}, ...
+                    ],
+                    "students": [
+                        {
+                            "id": int,
+                            "group": str,
+                            "debts": int,
+                            "debtsDetails": [...]
+                        }, ...
+                    ]
+                }
         """
+        cache_key = f"performance:{group}:{search}"
+        cached_data = cache.get(cache_key)
+        if cached_data:
+            return cached_data
+        
+        start_time = time.time()
+        
         queryset = cls.get_queryset()
         filtered_qs = cls.apply_filters(queryset, group=group, search=search)
 
-        # Выполняем запрос один раз
         students = list(filtered_qs)
 
-        # Подготавливаем данные
         students_data = []
         for s in students:
             students_data.append({
@@ -245,7 +286,7 @@ class AcademicPerformanceService:
         debt_dist = cls.get_debt_distribution(students)
         group_averages = cls.calculate_group_stats(students)
 
-        return {
+        result = {
             "debtsDistribution": {
                 "0": debt_dist['zero_debts'],
                 "1": debt_dist['one_debt'],
@@ -255,3 +296,7 @@ class AcademicPerformanceService:
             "groupAverages": group_averages,
             "students": students_data
         }
+        
+        cache.set(cache_key, result, 300)
+        
+        return result
