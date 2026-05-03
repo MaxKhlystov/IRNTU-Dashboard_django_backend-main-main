@@ -119,22 +119,31 @@ class SubjectStatisticsViewSet(ListModelMixin, GenericViewSet):
         - gradeDistributionBar: Распределение оценок (2,3,4,5).
         - bestSubjects: Топ предметов с метриками (avg, max, count, avgAttendance, avgActivity).
     """
-    queryset = StudentResult.objects.select_related('student', 'discipline', 'result')
+    permission_classes = [IsAuthenticated]
 
+    queryset = StudentResult.objects.select_related(
+        'student',
+        'discipline',
+        'result'
+    )
+
+    # =========================
+    # GET (legacy support)
+    # =========================
     def list(self, request, *args, **kwargs):
         course = request.query_params.get('course')
         subject = request.query_params.get('subject')
-        groups_param = request.query_params.get('groups', '')
-        sort_by = request.query_params.get('sortBy', 'avg')
-        limit = int(request.query_params.get('limit', 5))
 
+        groups_param = request.query_params.get('groups') or ''
+        sort_by = request.query_params.get('sortBy') or 'avg'
+
+        limit = request.query_params.get('limit') or 5
         try:
-            course = int(course) if course is not None else None
-        except ValueError:
-            course = None
+            limit = int(limit)
+        except:
+            limit = 5
 
-        groups = [g.strip() for g in groups_param.split(',')] if groups_param else []
-        groups = [g for g in groups if g]  # убираем пустые
+        groups = [g.strip() for g in groups_param.split(',') if g.strip()]
 
         data = SubjectStatisticsService.get_statistics(
             course=course,
@@ -143,8 +152,57 @@ class SubjectStatisticsViewSet(ListModelMixin, GenericViewSet):
             sort_by=sort_by,
             limit=limit
         )
+
         return Response(data)
-    
+
+    # =========================
+    # POST (MAIN — FIX 431)
+    # =========================
+    def create(self, request):
+        try:
+            data = request.data if isinstance(request.data, dict) else {}
+
+            course = data.get('course')
+            subject = data.get('subject')
+            sort_by = data.get('sortBy') or 'avg'
+
+            # limit safe parse
+            limit = data.get('limit') or 20
+            try:
+                limit = int(limit)
+            except:
+                limit = 20
+
+            # groups normalization (CRITICAL FIX)
+            groups = data.get('groups') or []
+
+            if isinstance(groups, str):
+                groups = [g.strip() for g in groups.split(',') if g.strip()]
+            elif not isinstance(groups, list):
+                groups = []
+
+            data = SubjectStatisticsService.get_statistics(
+                course=course,
+                subject=subject,
+                groups=groups,
+                sort_by=sort_by,
+                limit=limit
+            )
+
+            return Response(data)
+
+        except Exception as e:
+            import traceback
+            print("🔥 SubjectStatisticsViewSet ERROR:", str(e))
+            print(traceback.format_exc())
+
+            return Response(
+                {
+                    "error": "Internal Server Error",
+                    "detail": str(e)
+                },
+                status=500
+            )
 class StudentRatingViewSet(ListModelMixin, GenericViewSet):
     """
     ViewSet для формирования рейтинга студентов на основе комплексной оценки.
