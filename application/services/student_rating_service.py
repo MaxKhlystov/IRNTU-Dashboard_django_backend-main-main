@@ -1,5 +1,5 @@
 from datetime import datetime
-from time import time
+import time
 from django.core.cache import cache
 from typing import Optional, List, Dict, Any
 from application.models import Student, StudentResult, Attendance
@@ -371,28 +371,6 @@ class StudentRatingService:
     def get_rating_data(cls, course=None, group=None, subject=None, sort_by='rating', limit=10):
         """
         Основной метод сервиса. Формирует рейтинговый список студентов с полной аналитикой.
-        
-        Выполняет следующие шаги:
-        1. Фильтрация студентов по курсу, группе или предмету.
-        2. Расчет метрик для каждого студента (средний балл, активность, посещаемость).
-        3. Вычисление композитного рейтинга.
-        4. Сортировка и ограничение выборки (limit).
-        5. Расчет риска отчисления и детализация долгов для топ-N студентов.
-        6. Формирование ответа для графиков и таблиц.
-        
-        Args:
-            course (int, optional): Фильтр по номеру курса.
-            group (str, optional): Фильтр по названию группы.
-            subject (str, optional): Фильтр по предмету (включает студентов, у которых есть оценка по этому предмету).
-            sort_by (str): Критерий сортировки ('rating', 'performance', 'attendance', 'activity').
-            limit (int): Максимальное количество возвращаемых записей.
-            
-        Returns:
-            Dict[str, Any]: Структурированные данные:
-                {
-                    "chartData": [ ... ], # Данные для графиков
-                    "students": [ ... ]   # Детальные данные для таблицы
-                }
         """
         cache_key = f"rating:{course}:{group}:{subject}:{sort_by}:{limit}"
         cached = cache.get(cache_key)
@@ -409,6 +387,7 @@ class StudentRatingService:
             student_ids = list(qs.values_list('student_id', flat=True))
             if not student_ids:
                 return {'chartData': [], 'students': []}
+        
             
             grades_agg = StudentResult.objects.filter(
                 student_id__in=student_ids
@@ -456,12 +435,26 @@ class StudentRatingService:
                 attendance_percent = min((total_visits / max_visits) * 100, 100) if max_visits > 0 else 0
                 
                 has_debts = debt_count > 0
-                grade_score = avg_grade
+                
+                # Расчет компонентов активности (диапазон 0-5)
+                # 1. Успеваемость (нормализованная к 5)
+                grade_score = avg_grade  # уже в диапазоне 2-5, но может быть 0 если нет оценок
+                
+                # 2. Посещаемость (0-100% -> 0-5)
                 attendance_score = attendance_percent / 100 * 5
-                debt_bonus = 1.0 if not has_debts and avg_grade > 0 else 0
+                
+                # 3. Бонус за отсутствие долгов (если нет долгов и есть оценки)
+                debt_bonus = 1.0 if (not has_debts and avg_grade > 0) else 0
+                
+                # Активность: 50% успеваемость + 30% посещаемость + 20% бонус (макс 5.0)
+                # Формула: (grade_score * 0.5) + (attendance_score * 0.3) + (debt_bonus * 1.0)
+                # При max: (5 * 0.5=2.5) + (5 * 0.3=1.5) + 1.0 = 5.0
                 activity = (grade_score * 0.5) + (attendance_score * 0.3) + (debt_bonus * 1.0)
+                
+                # Рейтинг (шкала 0-100): активность * 20 (т.к. макс активность 5 -> 100)
                 rating = min(activity * 20, 100)
                 
+                # Определение курса
                 course_num = None
                 if group_name and '-' in group_name:
                     try:
@@ -482,11 +475,13 @@ class StudentRatingService:
                     'has_debts': has_debts
                 })
             
+            # Сортировка
             sort_map = {'rating': 'rating', 'performance': 'avg_grade', 
                         'attendance': 'attendance_percent', 'activity': 'activity'}
             results.sort(key=lambda x: x[sort_map.get(sort_by, 'rating')], reverse=True)
             results = results[:limit]
             
+            # Формирование ответа
             students_response = [{
                 'id': r['student_id'],
                 'name': f"Студент {r['student_id']}",
@@ -496,8 +491,10 @@ class StudentRatingService:
                 'activity': r['activity'],
                 'attendancePercent': r['attendance_percent'],
                 'debtCount': r['debt_count'],
-                'debtsDetails': [],
-                'rating': r['rating']
+                'debtsDetails': cls.get_student_debts_details(r['student_id']) if r['debt_count'] > 0 else [],
+                'rating': r['rating'],
+                'dropoutRisk': 0.0,  # Можно добавить позже
+                'riskLevel': 'низкий'
             } for r in results]
             
             result = {'chartData': students_response, 'students': students_response}
@@ -507,8 +504,10 @@ class StudentRatingService:
             return result
             
         except Exception as e:
+            import traceback
             traceback.print_exc()
             return {'chartData': [], 'students': []}
+    
     # #@classmethod
     # def get_rating_data(
     #     cls,
