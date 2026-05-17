@@ -5,6 +5,7 @@ from typing import Optional, List, Dict, Any
 from application.models import Student, StudentResult, Attendance
 from django.db.models import Avg, Count, Q, Value, FloatField, Case, When
 from django.db.models.functions import Cast
+from django.core.paginator import Paginator, EmptyPage, PageNotAnInteger
 import traceback
 
 
@@ -218,25 +219,7 @@ class StudentRatingService:
     def calculate_dropout_risk(cls, student_id: int, avg_grade: float, attendance_percent: float, activity: float) -> float:
         """
         Рассчитывает вероятность отчисления студента (Risk Score) в диапазоне от 0.0 до 1.0.
-        
-        Факторы риска:
-        1. Низкий средний балл (критический порог < 3.0).
-        2. Низкая посещаемость (критический порог < 50% от лидера).
-        3. Наличие академических задолженностей (наибольший вес).
-        
-        Весовые коэффициенты:
-        - Долги: 50%
-        - Оценки: 30%
-        - Посещаемость: 20%
-        
-        Args:
-            student_id (int): ID студента.
-            avg_grade (float): Средний балл студента.
-            attendance_percent (float): Процент посещаемости.
-            activity (float): Показатель активности (используется косвенно или для логирования).
-            
-        Returns:
-            float: Уровень риска (0.0 - низкий, 1.0 - критический).
+        Улучшенная логика с более реалистичными значениями.
         """
         # Подсчет долгов
         debt_count = StudentResult.objects.filter(
@@ -244,31 +227,55 @@ class StudentRatingService:
             result__result_value__in=['2', 'Н/Я', 'Не зачтено']
         ).count()
         
-        # Компонент риска по оценкам (если ср.балл < 3, риск растет экспоненциально)
-        grade_risk = 0.0
-        if avg_grade > 0:
-            if avg_grade >= 4.5:
-                grade_risk = 0.0
-            elif avg_grade >= 3.0:
-                grade_risk = (4.5 - avg_grade) / 3.0 * 0.4 # Макс 0.2
-            else:
-                grade_risk = 0.4 + ((3.0 - avg_grade) / 3.0) * 0.4 # До 0.8
-
-        # Компонент риска по посещаемости
-        attendance_risk = 0.0
-        if attendance_percent >= 80:
-            attendance_risk = 0.0
-        elif attendance_percent >= 50:
-            attendance_risk = ((80 - attendance_percent) / 30.0) * 0.2
+        # Базовый риск (0-1)
+        # ДОЛГИ - самый важный фактор (вес 50%)
+        if debt_count == 0:
+            debt_risk = 0.0
+        elif debt_count == 1:
+            debt_risk = 0.4
+        elif debt_count == 2:
+            debt_risk = 0.7
         else:
-            attendance_risk = 0.2 + ((50 - attendance_percent) / 50.0) * 0.3 
-
-        # Компонент риска по долгам (самый весомый)
-        debt_risk = min(debt_count * 0.25, 1.0) # 4 долга = 100% риск
-
+            debt_risk = 1.0
+        
+        # ОЦЕНКИ - второй по важности фактор (вес 30%)
+        if avg_grade >= 4.5:
+            grade_risk = 0.0
+        elif avg_grade >= 4.0:
+            grade_risk = 0.1
+        elif avg_grade >= 3.5:
+            grade_risk = 0.2
+        elif avg_grade >= 3.0:
+            grade_risk = 0.35
+        elif avg_grade >= 2.5:
+            grade_risk = 0.55
+        elif avg_grade > 0:
+            grade_risk = 0.75
+        else:
+            grade_risk = 0.3  # Нет оценок - средний риск
+        
+        # ПОСЕЩАЕМОСТЬ - третий фактор (вес 20%)
+        if attendance_percent >= 90:
+            attendance_risk = 0.0
+        elif attendance_percent >= 75:
+            attendance_risk = 0.15
+        elif attendance_percent >= 50:
+            attendance_risk = 0.35
+        elif attendance_percent >= 25:
+            attendance_risk = 0.6
+        else:
+            attendance_risk = 0.85
+        
         # Взвешенная сумма
-        # Долги имеют наибольший вес, так как это прямой путь к отчислению
         total_risk = (grade_risk * 0.3) + (attendance_risk * 0.2) + (debt_risk * 0.5)
+        
+        # Корректировка для крайних случаев
+        if debt_count == 0 and avg_grade >= 4.0 and attendance_percent >= 75:
+            total_risk = min(total_risk, 0.15)  # Отличники с хорошей посещаемостью
+        elif debt_count >= 2 and avg_grade < 3.0:
+            total_risk = max(total_risk, 0.6)   # Должники с плохими оценками
+        elif debt_count == 0 and attendance_percent < 30:
+            total_risk = max(total_risk, 0.3)   # Прогулы даже без долгов
         
         return max(0.0, min(1.0, round(total_risk, 2)))
 
@@ -336,7 +343,7 @@ class StudentRatingService:
         """
         if risk_score < 0.3:
             return "низкий"
-        elif risk_score < 0.7:
+        elif risk_score < 0.65:
             return "средний"
         else:
             return "высокий"
@@ -366,148 +373,203 @@ class StudentRatingService:
                         student_ids.append(student.student_id)
         return student_ids
 
-    #Новая версия
     @classmethod
-    def get_rating_data(cls, course=None, group=None, subject=None, sort_by='rating', limit=10):
+    def get_rating_data(cls, course=None, group=None, subject=None, sort_by='rating', limit=10, page=1):
         """
         Основной метод сервиса. Формирует рейтинговый список студентов с полной аналитикой.
+        Теперь с поддержкой пагинации.
+        
+        Args:
+            course: Фильтр по курсу
+            group: Фильтр по группе
+            subject: Фильтр по предмету
+            sort_by: Критерий сортировки
+            limit: Количество записей на страницу
+            page: Номер страницы (1-based)
         """
-        cache_key = f"rating:{course}:{group}:{subject}:{sort_by}:{limit}"
-        cached = cache.get(cache_key)
-        if cached:
-            return cached
+        # Кэшируем только данные без пагинации (общий список)
+        cache_key = f"rating_data:{course}:{group}:{subject}:{sort_by}"
+        cached_data = cache.get(cache_key)
         
-        start = time.time()
-        
-        try:
-            qs = Student.objects.filter(is_academic=False)
-            if group:
-                qs = qs.filter(group__name=group)
-            
-            student_ids = list(qs.values_list('student_id', flat=True))
-            if not student_ids:
-                return {'chartData': [], 'students': []}
-        
-            
-            grades_agg = StudentResult.objects.filter(
-                student_id__in=student_ids
-            ).values('student_id').annotate(
-                avg_grade=Avg(
-                    Case(
-                        When(result__result_value__in=['2','3','4','5'], 
-                            then=Cast('result__result_value', FloatField())),
-                        default=None,
-                        output_field=FloatField()
-                    )
-                ),
-                debt_count=Count('student_id', filter=Q(result__result_value__in=['2', 'Н/Я', 'Не зачтено']))
-            )
-            
-            attendance_agg = Attendance.objects.filter(
-                student_id__in=student_ids
-            ).values('student_id').annotate(
-                total_visits=Count('lesson_id')
-            )
-            
-            max_att_by_group = dict(
-                Attendance.objects.filter(
-                    student__group__isnull=False,
+        if cached_data is None:
+            # Получаем все данные (без пагинации)
+            try:
+                qs = Student.objects.filter(is_academic=False)
+                if group:
+                    qs = qs.filter(group__name=group)
+                
+                # Фильтр по курсу (если указан)
+                if course is not None:
+                    valid_ids = cls.get_students_in_course(course)
+                    qs = qs.filter(student_id__in=valid_ids)
+                
+                # Фильтр по предмету (если указан)
+                if subject:
+                    student_ids_with_subject = StudentResult.objects.filter(
+                        discipline__name__icontains=subject
+                    ).values_list('student_id', flat=True).distinct()
+                    qs = qs.filter(student_id__in=student_ids_with_subject)
+                
+                student_ids = list(qs.values_list('student_id', flat=True))
+                if not student_ids:
+                    return {'chartData': [], 'students': [], 'total': 0, 'page': page, 'total_pages': 0}
+                
+                # Агрегация данных (как раньше)
+                grades_agg = StudentResult.objects.filter(
                     student_id__in=student_ids
-                ).values('student__group__name').annotate(
-                    max_visits=Count('lesson_id')
-                ).values_list('student__group__name', 'max_visits')
-            )
-            
-            grades_dict = {g['student_id']: {'avg': float(g['avg_grade'] or 0), 'debts': g['debt_count']} 
-                        for g in grades_agg}
-            attendance_dict = {a['student_id']: a['total_visits'] for a in attendance_agg}
-            
-            results = []
-            for student in qs.select_related('group'):
-                sid = student.student_id
-                group_name = student.group.name if student.group else 'Неизвестно'
+                ).values('student_id').annotate(
+                    avg_grade=Avg(
+                        Case(
+                            When(result__result_value__in=['2','3','4','5'], 
+                                then=Cast('result__result_value', FloatField())),
+                            default=None,
+                            output_field=FloatField()
+                        )
+                    ),
+                    debt_count=Count('student_id', filter=Q(result__result_value__in=['2', 'Н/Я', 'Не зачтено']))
+                )
                 
-                avg_grade = grades_dict.get(sid, {}).get('avg', 0)
-                debt_count = grades_dict.get(sid, {}).get('debts', 0)
-                total_visits = attendance_dict.get(sid, 0)
-                max_visits = max_att_by_group.get(group_name, 1)
+                attendance_agg = Attendance.objects.filter(
+                    student_id__in=student_ids
+                ).values('student_id').annotate(
+                    total_visits=Count('lesson_id')
+                )
                 
-                attendance_percent = min((total_visits / max_visits) * 100, 100) if max_visits > 0 else 0
+                max_att_by_group = dict(
+                    Attendance.objects.filter(
+                        student__group__isnull=False,
+                        student_id__in=student_ids
+                    ).values('student__group__name').annotate(
+                        max_visits=Count('lesson_id')
+                    ).values_list('student__group__name', 'max_visits')
+                )
                 
-                has_debts = debt_count > 0
+                grades_dict = {g['student_id']: {'avg': float(g['avg_grade'] or 0), 'debts': g['debt_count']} 
+                            for g in grades_agg}
+                attendance_dict = {a['student_id']: a['total_visits'] for a in attendance_agg}
                 
-                # Расчет компонентов активности (диапазон 0-5)
-                # 1. Успеваемость (нормализованная к 5)
-                grade_score = avg_grade  # уже в диапазоне 2-5, но может быть 0 если нет оценок
+                results = []
+                for student in qs.select_related('group'):
+                    sid = student.student_id
+                    group_name = student.group.name if student.group else 'Неизвестно'
+                    
+                    avg_grade = grades_dict.get(sid, {}).get('avg', 0)
+                    debt_count = grades_dict.get(sid, {}).get('debts', 0)
+                    total_visits = attendance_dict.get(sid, 0)
+                    max_visits = max_att_by_group.get(group_name, 1)
+                    
+                    attendance_percent = min((total_visits / max_visits) * 100, 100) if max_visits > 0 else 0
+                    has_debts = debt_count > 0
+                    
+                    # Расчет активности
+                    grade_score = avg_grade
+                    attendance_score = attendance_percent / 100 * 5
+                    debt_bonus = 1.0 if (not has_debts and avg_grade > 0) else 0
+                    activity = (grade_score * 0.5) + (attendance_score * 0.3) + (debt_bonus * 1.0)
+                    
+                    # Рейтинг
+                    rating = min(activity * 20, 100)
+                    
+                    # Определение курса
+                    course_num = None
+                    if group_name and '-' in group_name:
+                        try:
+                            year_suffix = int(group_name.split('-')[1][:2])
+                            course_num = cls.calculate_course(2000 + year_suffix)
+                        except:
+                            pass
+                    
+                    # Расчет риска
+                    dropout_risk = cls.calculate_dropout_risk(sid, avg_grade, attendance_percent, activity)
+                    status = cls.get_student_status(sid, avg_grade, attendance_percent, debt_count, dropout_risk)
+                    results.append({
+                        'id': sid,
+                        'name': f"Студент {sid}",
+                        'group': group_name,
+                        'course': course_num,
+                        'avgGrade': round(avg_grade, 2),
+                        'activity': round(activity, 2),
+                        'attendancePercent': round(attendance_percent, 2),
+                        'rating': round(rating, 2),
+                        'debtCount': debt_count,
+                        'debtsDetails': cls.get_student_debts_details(sid) if debt_count > 0 else [],
+                        'dropoutRisk': dropout_risk,
+                        'riskLevel': cls.get_risk_level(dropout_risk),
+                        'status' : status
+                    })
                 
-                # 2. Посещаемость (0-100% -> 0-5)
-                attendance_score = attendance_percent / 100 * 5
+                # Сортировка
+                sort_map = {'rating': 'rating', 'performance': 'avgGrade', 
+                            'attendance': 'attendancePercent', 'activity': 'activity'}
+                results.sort(key=lambda x: x[sort_map.get(sort_by, 'rating')], reverse=True)
                 
-                # 3. Бонус за отсутствие долгов (если нет долгов и есть оценки)
-                debt_bonus = 1.0 if (not has_debts and avg_grade > 0) else 0
+                # Сохраняем в кэш (без пагинации, на 10 минут)
+                cached_data = results
+                cache.set(cache_key, results, 600)  # 10 минут
                 
-                # Активность: 50% успеваемость + 30% посещаемость + 20% бонус (макс 5.0)
-                # Формула: (grade_score * 0.5) + (attendance_score * 0.3) + (debt_bonus * 1.0)
-                # При max: (5 * 0.5=2.5) + (5 * 0.3=1.5) + 1.0 = 5.0
-                activity = (grade_score * 0.5) + (attendance_score * 0.3) + (debt_bonus * 1.0)
-                
-                # Рейтинг (шкала 0-100): активность * 20 (т.к. макс активность 5 -> 100)
-                rating = min(activity * 20, 100)
-                
-                # Определение курса
-                course_num = None
-                if group_name and '-' in group_name:
-                    try:
-                        year_suffix = int(group_name.split('-')[1][:2])
-                        course_num = cls.calculate_course(2000 + year_suffix)
-                    except:
-                        pass
-                
-                results.append({
-                    'student_id': sid,
-                    'group': group_name,
-                    'course': course_num,
-                    'avg_grade': round(avg_grade, 2),
-                    'activity': round(activity, 2),
-                    'attendance_percent': round(attendance_percent, 2),
-                    'rating': round(rating, 2),
-                    'debt_count': debt_count,
-                    'has_debts': has_debts
-                })
-            
-            # Сортировка
-            sort_map = {'rating': 'rating', 'performance': 'avg_grade', 
-                        'attendance': 'attendance_percent', 'activity': 'activity'}
-            results.sort(key=lambda x: x[sort_map.get(sort_by, 'rating')], reverse=True)
-            results = results[:limit]
-            
-            # Формирование ответа
-            students_response = [{
-                'id': r['student_id'],
-                'name': f"Студент {r['student_id']}",
-                'group': r['group'],
-                'course': r['course'],
-                'avgGrade': r['avg_grade'],
-                'activity': r['activity'],
-                'attendancePercent': r['attendance_percent'],
-                'debtCount': r['debt_count'],
-                'debtsDetails': cls.get_student_debts_details(r['student_id']) if r['debt_count'] > 0 else [],
-                'rating': r['rating'],
-                'dropoutRisk': 0.0,  # Можно добавить позже
-                'riskLevel': 'низкий'
-            } for r in results]
-            
-            result = {'chartData': students_response, 'students': students_response}
-            
-            cache.set(cache_key, result, 300)
-            
-            return result
-            
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
-            return {'chartData': [], 'students': []}
-    
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                return {'chartData': [], 'students': [], 'total': 0, 'page': page, 'total_pages': 0}
+        else:
+            results = cached_data
+        
+        # Пагинация
+        total = len(results)
+        total_pages = (total + limit - 1) // limit if limit > 0 else 1
+        
+        # Получаем нужную страницу
+        start_idx = (page - 1) * limit
+        end_idx = start_idx + limit
+        paged_results = results[start_idx:end_idx]
+        
+        # Данные для графиков (всегда берем топ-10 из отсортированного списка)
+        chart_data = results[:10] if len(results) > 10 else results
+        
+        return {
+            'chartData': chart_data,
+            'students': paged_results,
+            'total': total,
+            'page': page,
+            'total_pages': total_pages,
+            'limit': limit
+        }
+    @classmethod
+    def get_student_status(cls, student_id: int, avg_grade: float, attendance_percent: float, debt_count: int, dropout_risk: float) -> str:
+        """
+        Определяет статус студента на основе реальных данных.
+        
+        Возможные статусы:
+        - "Отличник": средний балл >= 4.5, посещаемость >= 80%, нет долгов
+        - "Хорошист": средний балл >= 4.0, посещаемость >= 70%, нет долгов
+        - "Зона риска": риск отчисления > 0.5 ИЛИ есть долги
+        - "Прогульщик": посещаемость < 50%, но нет долгов
+        - "Троечник": средний балл < 4.0, но >= 3.0
+        - "Должник": есть долги (2, Н/Я, Не зачтено)
+        - "Нужно подтянуть": средний балл < 3.0
+        """
+        if debt_count > 0:
+            return "Должник"
+        
+        if dropout_risk > 0.6:
+            return "Зона риска"
+        
+        if avg_grade >= 4.5 and attendance_percent >= 80:
+            return "Отличник"
+        
+        if avg_grade >= 4.0 and attendance_percent >= 70:
+            return "Хорошист"
+        
+        if attendance_percent < 50:
+            return "Прогульщик"
+        
+        if avg_grade >= 3.0:
+            return "Троечник"
+        
+        if avg_grade < 3.0 and avg_grade > 0:
+            return "Нужно подтянуть"
+        
+        return "Нет данных"
     # #@classmethod
     # def get_rating_data(
     #     cls,

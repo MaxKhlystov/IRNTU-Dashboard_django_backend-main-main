@@ -153,7 +153,7 @@ WSGI_APPLICATION = 'app.wsgi.application'
 DATABASES = {
     'default': {
         'ENGINE': 'django.db.backends.postgresql_psycopg2',
-        'NAME': os.environ.get('DB_NAME', 'project_db'),
+        'NAME': os.environ.get('DB_NAME', 'back'),
         'USER': os.environ.get('DB_USER', 'postgres'),
         'PASSWORD': os.environ.get('DB_PASSWORD', '12345'),
         'HOST': os.environ.get('DB_HOST', 'localhost'),
@@ -276,3 +276,5 @@ CACHES = {
         'LOCATION': 'unique-snowflake',
     }
 }
+
+DEBUG = True
