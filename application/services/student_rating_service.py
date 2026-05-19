@@ -7,7 +7,7 @@ from django.db.models import Avg, Count, Q, Value, FloatField, Case, When
 from django.db.models.functions import Cast
 from django.core.paginator import Paginator, EmptyPage, PageNotAnInteger
 import traceback
-
+from application.ml_models.predictor import predictor
 
 class StudentRatingService:
     """
@@ -216,68 +216,11 @@ class StudentRatingService:
         return min(round(activity_score, 2), 5.0)
 
     @classmethod
+   
     def calculate_dropout_risk(cls, student_id: int, avg_grade: float, attendance_percent: float, activity: float) -> float:
-        """
-        Рассчитывает вероятность отчисления студента (Risk Score) в диапазоне от 0.0 до 1.0.
-        Улучшенная логика с более реалистичными значениями.
-        """
-        # Подсчет долгов
-        debt_count = StudentResult.objects.filter(
-            student_id=student_id,
-            result__result_value__in=['2', 'Н/Я', 'Не зачтено']
-        ).count()
+
         
-        # Базовый риск (0-1)
-        # ДОЛГИ - самый важный фактор (вес 50%)
-        if debt_count == 0:
-            debt_risk = 0.0
-        elif debt_count == 1:
-            debt_risk = 0.4
-        elif debt_count == 2:
-            debt_risk = 0.7
-        else:
-            debt_risk = 1.0
-        
-        # ОЦЕНКИ - второй по важности фактор (вес 30%)
-        if avg_grade >= 4.5:
-            grade_risk = 0.0
-        elif avg_grade >= 4.0:
-            grade_risk = 0.1
-        elif avg_grade >= 3.5:
-            grade_risk = 0.2
-        elif avg_grade >= 3.0:
-            grade_risk = 0.35
-        elif avg_grade >= 2.5:
-            grade_risk = 0.55
-        elif avg_grade > 0:
-            grade_risk = 0.75
-        else:
-            grade_risk = 0.3  # Нет оценок - средний риск
-        
-        # ПОСЕЩАЕМОСТЬ - третий фактор (вес 20%)
-        if attendance_percent >= 90:
-            attendance_risk = 0.0
-        elif attendance_percent >= 75:
-            attendance_risk = 0.15
-        elif attendance_percent >= 50:
-            attendance_risk = 0.35
-        elif attendance_percent >= 25:
-            attendance_risk = 0.6
-        else:
-            attendance_risk = 0.85
-        
-        # Взвешенная сумма
-        total_risk = (grade_risk * 0.3) + (attendance_risk * 0.2) + (debt_risk * 0.5)
-        
-        # Корректировка для крайних случаев
-        if debt_count == 0 and avg_grade >= 4.0 and attendance_percent >= 75:
-            total_risk = min(total_risk, 0.15)  # Отличники с хорошей посещаемостью
-        elif debt_count >= 2 and avg_grade < 3.0:
-            total_risk = max(total_risk, 0.6)   # Должники с плохими оценками
-        elif debt_count == 0 and attendance_percent < 30:
-            total_risk = max(total_risk, 0.3)   # Прогулы даже без долгов
-        
-        return max(0.0, min(1.0, round(total_risk, 2)))
+        return 0.5
 
     @classmethod
     def get_student_debts_details(cls, student_id: int) -> List[Dict[str, str]]:
@@ -377,15 +320,7 @@ class StudentRatingService:
     def get_rating_data(cls, course=None, group=None, subject=None, sort_by='rating', limit=10, page=1):
         """
         Основной метод сервиса. Формирует рейтинговый список студентов с полной аналитикой.
-        Теперь с поддержкой пагинации.
-        
-        Args:
-            course: Фильтр по курсу
-            group: Фильтр по группе
-            subject: Фильтр по предмету
-            sort_by: Критерий сортировки
-            limit: Количество записей на страницу
-            page: Номер страницы (1-based)
+        Теперь с поддержкой пагинации и пакетным ML предсказанием.
         """
         # Кэшируем только данные без пагинации (общий список)
         cache_key = f"rating_data:{course}:{group}:{subject}:{sort_by}"
@@ -414,7 +349,7 @@ class StudentRatingService:
                 if not student_ids:
                     return {'chartData': [], 'students': [], 'total': 0, 'page': page, 'total_pages': 0}
                 
-                # Агрегация данных (как раньше)
+                # Агрегация данных
                 grades_agg = StudentResult.objects.filter(
                     student_id__in=student_ids
                 ).values('student_id').annotate(
@@ -426,7 +361,8 @@ class StudentRatingService:
                             output_field=FloatField()
                         )
                     ),
-                    debt_count=Count('student_id', filter=Q(result__result_value__in=['2', 'Н/Я', 'Не зачтено']))
+                    debt_count=Count('student_id', filter=Q(result__result_value__in=['2', 'Н/Я', 'Не зачтено'])),
+                    total_subjects=Count('student_id')
                 )
                 
                 attendance_agg = Attendance.objects.filter(
@@ -444,17 +380,24 @@ class StudentRatingService:
                     ).values_list('student__group__name', 'max_visits')
                 )
                 
-                grades_dict = {g['student_id']: {'avg': float(g['avg_grade'] or 0), 'debts': g['debt_count']} 
-                            for g in grades_agg}
+                grades_dict = {g['student_id']: {
+                    'avg': float(g['avg_grade'] or 0), 
+                    'debts': g['debt_count'],
+                    'total_subjects': g['total_subjects']
+                } for g in grades_agg}
                 attendance_dict = {a['student_id']: a['total_visits'] for a in attendance_agg}
                 
-                results = []
+                # ========== ПАКЕТНЫЙ СБОР ДАННЫХ ==========
+                students_list = []
+                students_info = []
+                
                 for student in qs.select_related('group'):
                     sid = student.student_id
                     group_name = student.group.name if student.group else 'Неизвестно'
                     
                     avg_grade = grades_dict.get(sid, {}).get('avg', 0)
                     debt_count = grades_dict.get(sid, {}).get('debts', 0)
+                    total_subjects = grades_dict.get(sid, {}).get('total_subjects', 0)
                     total_visits = attendance_dict.get(sid, 0)
                     max_visits = max_att_by_group.get(group_name, 1)
                     
@@ -479,23 +422,76 @@ class StudentRatingService:
                         except:
                             pass
                     
-                    # Расчет риска
-                    dropout_risk = cls.calculate_dropout_risk(sid, avg_grade, attendance_percent, activity)
-                    status = cls.get_student_status(sid, avg_grade, attendance_percent, debt_count, dropout_risk)
+                    # Данные для ML предсказания
+                    students_list.append({
+                        'avg_grade': avg_grade,
+                        'attendance_percent': attendance_percent,
+                        'debt_count': debt_count,
+                        'total_subjects': total_subjects,
+                        'debt_ratio': debt_count / max(total_subjects, 1),
+                        'grade_trend': 0,
+                        'course': course_num or 1,
+                        'semester_debts': debt_count
+                    })
+                    
+                    # Данные для результата
+                    students_info.append({
+                        'sid': sid,
+                        'group_name': group_name,
+                        'course_num': course_num,
+                        'avg_grade': avg_grade,
+                        'activity': activity,
+                        'attendance_percent': attendance_percent,
+                        'rating': rating,
+                        'debt_count': debt_count,
+                        'has_debts': has_debts
+                    })
+                
+                # ========== ПАКЕТНОЕ ML ПРЕДСКАЗАНИЕ (ОДИН РАЗ ДЛЯ ВСЕХ) ==========
+                from application.ml_models.predictor import predictor
+                
+                # Подготавливаем данные только с нужными признаками
+                ml_input_data = []
+                for student in students_list:
+                    ml_input_data.append({
+                        'avg_grade': student['avg_grade'],
+                        'attendance_percent': student['attendance_percent'],
+                        'debt_count': student['debt_count'],
+                        'debt_ratio': student['debt_ratio'],  # ← Добавь эту строку
+                        'total_subjects': student['total_subjects']
+                    })
+                
+                # ОДНО пакетное предсказание для всех студентов
+                risks = predictor.predict_batch(ml_input_data)
+                
+                # ========== ФОРМИРУЕМ РЕЗУЛЬТАТЫ ==========
+                # ========== ФОРМИРУЕМ РЕЗУЛЬТАТЫ ==========
+                results = []
+                for i, info in enumerate(students_info):
+                    dropout_risk = risks[i]  # ← Берем риск из ML модели
+                    
+                    status = cls.get_student_status(
+                        info['sid'], 
+                        info['avg_grade'], 
+                        info['attendance_percent'], 
+                        info['debt_count'], 
+                        dropout_risk
+                    )
+                    
                     results.append({
-                        'id': sid,
-                        'name': f"Студент {sid}",
-                        'group': group_name,
-                        'course': course_num,
-                        'avgGrade': round(avg_grade, 2),
-                        'activity': round(activity, 2),
-                        'attendancePercent': round(attendance_percent, 2),
-                        'rating': round(rating, 2),
-                        'debtCount': debt_count,
-                        'debtsDetails': cls.get_student_debts_details(sid) if debt_count > 0 else [],
-                        'dropoutRisk': dropout_risk,
+                        'id': info['sid'],
+                        'name': f"Студент {info['sid']}",
+                        'group': info['group_name'],
+                        'course': info['course_num'],
+                        'avgGrade': round(info['avg_grade'], 2),
+                        'activity': round(info['activity'], 2),
+                        'attendancePercent': round(info['attendance_percent'], 2),
+                        'rating': round(info['rating'], 2),
+                        'debtCount': info['debt_count'],
+                        'debtsDetails': cls.get_student_debts_details(info['sid']) if info['debt_count'] > 0 else [],
+                        'dropoutRisk': dropout_risk,  # ← Теперь это risks[i]
                         'riskLevel': cls.get_risk_level(dropout_risk),
-                        'status' : status
+                        'status': status
                     })
                 
                 # Сортировка
@@ -503,9 +499,9 @@ class StudentRatingService:
                             'attendance': 'attendancePercent', 'activity': 'activity'}
                 results.sort(key=lambda x: x[sort_map.get(sort_by, 'rating')], reverse=True)
                 
-                # Сохраняем в кэш (без пагинации, на 10 минут)
+                # Сохраняем в кэш на 10 минут
+                cache.set(cache_key, results, 600)
                 cached_data = results
-                cache.set(cache_key, results, 600)  # 10 минут
                 
             except Exception as e:
                 import traceback
@@ -534,6 +530,8 @@ class StudentRatingService:
             'total_pages': total_pages,
             'limit': limit
         }
+        
+      
     @classmethod
     def get_student_status(cls, student_id: int, avg_grade: float, attendance_percent: float, debt_count: int, dropout_risk: float) -> str:
         """
