@@ -6,7 +6,7 @@
 ```
 python3 -m venv env
 
-### Запуск в Политехе
+## Запуск проекта
 python3 -m venv env
 pip install -r requirements.txt --proxy=http://172.27.100.5:4444
 ```
