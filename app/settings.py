@@ -232,10 +232,10 @@ REST_FRAMEWORK = {
     ],
     'DEFAULT_PERMISSION_CLASSES': [
         #закомментил для теста сервера, там не пускает без авторизации, а не авторизуются фильтры
-        # 'rest_framework.permissions.DjangoModelPermissions',
-        # 'rest_framework.permissions.IsAuthenticated',
+        'rest_framework.permissions.DjangoModelPermissions',
+        'rest_framework.permissions.IsAuthenticated',
         #пока разрешаем всем
-        'rest_framework.permissions.AllowAny',
+        #'rest_framework.permissions.AllowAny',
     ],
     'DEFAULT_RENDERER_CLASSES': (
         'rest_framework.renderers.JSONRenderer',
